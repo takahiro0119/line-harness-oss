@@ -13,6 +13,15 @@ import {
   upsertChatOnMessage,
   getLineAccounts,
   jstNow,
+  upsertGroup,
+  upsertGroupMember,
+  removeGroupMember,
+  logGroupMessage,
+  getGroupByLineGroupId,
+  getAttendanceSchedules,
+  getGroupMembers,
+  upsertAttendanceRecord,
+  parseAttendanceReply,
 } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
@@ -186,10 +195,9 @@ async function handleEvent(
     return;
   }
 
-  if (event.type === 'message' && event.message.type === 'text') {
+  if (event.type === 'message' && event.message.type === 'text' && event.source.type === 'user') {
     const textMessage = event.message as TextEventMessage;
-    const userId =
-      event.source.type === 'user' ? event.source.userId : undefined;
+    const userId = event.source.userId;
     if (!userId) return;
 
     const friend = await getFriendByLineUserId(db, userId);
@@ -357,6 +365,172 @@ async function handleEvent(
       friendId: friend.id,
       eventData: { text: incomingText, matched },
     }, lineAccessToken, lineAccountId);
+
+    return;
+  }
+
+  // ─── グループ参加イベント ─────────────────────────────────────────────────
+  if (event.type === 'join' && event.source.type === 'group') {
+    const groupId = event.source.groupId;
+    console.log(`Bot joined group: ${groupId}`);
+
+    // グループ情報取得 & DB登録
+    let groupName: string | null = null;
+    try {
+      const summary = await lineClient.getGroupSummary(groupId);
+      groupName = summary.groupName;
+    } catch (err) {
+      console.error('Failed to get group summary:', err);
+    }
+
+    await upsertGroup(db, {
+      lineGroupId: groupId,
+      name: groupName,
+      lineAccountId,
+    });
+
+    // メンバー一覧取得 & 登録
+    try {
+      const group = await getGroupByLineGroupId(db, groupId);
+      if (group) {
+        const memberResult = await lineClient.getGroupMemberIds(groupId);
+        for (const memberId of memberResult.memberIds) {
+          let memberName: string | null = null;
+          try {
+            const profile = await lineClient.getGroupMemberProfile(groupId, memberId);
+            memberName = profile.displayName;
+          } catch { /* some members may not be fetchable */ }
+          await upsertGroupMember(db, {
+            groupId: group.id,
+            lineUserId: memberId,
+            displayName: memberName,
+          });
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch group members:', err);
+    }
+
+    return;
+  }
+
+  // ─── グループ退出イベント ─────────────────────────────────────────────────
+  if (event.type === 'leave' && event.source.type === 'group') {
+    const groupId = event.source.groupId;
+    console.log(`Bot left group: ${groupId}`);
+    const group = await getGroupByLineGroupId(db, groupId);
+    if (group) {
+      await db.prepare('UPDATE groups SET is_active = 0, updated_at = ? WHERE id = ?')
+        .bind(jstNow(), group.id).run();
+    }
+    return;
+  }
+
+  // ─── メンバー参加イベント ─────────────────────────────────────────────────
+  if (event.type === 'memberJoined' && event.source.type === 'group') {
+    const groupId = event.source.groupId;
+    const group = await getGroupByLineGroupId(db, groupId);
+    if (!group) return;
+
+    for (const member of event.joined.members) {
+      let memberName: string | null = null;
+      try {
+        const profile = await lineClient.getGroupMemberProfile(groupId, member.userId);
+        memberName = profile.displayName;
+      } catch { /* ignore */ }
+      await upsertGroupMember(db, {
+        groupId: group.id,
+        lineUserId: member.userId,
+        displayName: memberName,
+      });
+    }
+    return;
+  }
+
+  // ─── メンバー退出イベント ─────────────────────────────────────────────────
+  if (event.type === 'memberLeft' && event.source.type === 'group') {
+    const groupId = event.source.groupId;
+    const group = await getGroupByLineGroupId(db, groupId);
+    if (!group) return;
+
+    for (const member of event.left.members) {
+      await removeGroupMember(db, group.id, member.userId);
+    }
+    return;
+  }
+
+  // ─── グループ内メッセージ ─────────────────────────────────────────────────
+  if (event.type === 'message' && event.message.type === 'text' && event.source.type === 'group') {
+    const groupId = event.source.groupId;
+    const userId = event.source.userId;
+    if (!userId) return;
+
+    const group = await getGroupByLineGroupId(db, groupId);
+    if (!group) return;
+
+    const textMessage = event.message as TextEventMessage;
+    const incomingText = textMessage.text;
+
+    // メンバープロフィール取得 & 更新
+    let memberProfile: { displayName: string; pictureUrl?: string } | null = null;
+    try {
+      const profile = await lineClient.getGroupMemberProfile(groupId, userId);
+      memberProfile = profile;
+      await upsertGroupMember(db, {
+        groupId: group.id,
+        lineUserId: userId,
+        displayName: profile.displayName,
+        pictureUrl: profile.pictureUrl ?? null,
+      });
+    } catch { /* ignore — profile fetch can fail */ }
+
+    // メッセージログ記録
+    await logGroupMessage(db, {
+      groupId: group.id,
+      lineUserId: userId,
+      direction: 'incoming',
+      messageType: 'text',
+      content: incomingText,
+    });
+
+    // 勤怠回答チェック: このグループにアクティブなスケジュールがあるか
+    const schedules = await getAttendanceSchedules(db, group.id);
+    const activeSchedules = schedules.filter(s => s.is_active);
+
+    if (activeSchedules.length > 0) {
+      const status = parseAttendanceReply(incomingText);
+      if (status !== 'other' || /^(出勤|休み|欠勤|遅刻|出社|お休み)/.test(incomingText.trim())) {
+        // 今日の日付 (JST)
+        const now = new Date(Date.now() + 9 * 60 * 60_000);
+        const targetDate = now.toISOString().slice(0, 10);
+
+        // メンバーの表示名取得
+        let displayName: string | null = null;
+        try {
+          const profile = await lineClient.getGroupMemberProfile(groupId, userId);
+          displayName = profile.displayName;
+        } catch { /* ignore */ }
+
+        // 最初のアクティブスケジュールに対して記録
+        const schedule = activeSchedules[0];
+        await upsertAttendanceRecord(db, {
+          scheduleId: schedule.id,
+          groupId: group.id,
+          lineUserId: userId,
+          displayName,
+          targetDate,
+          status,
+          rawReply: incomingText,
+        });
+
+        // メンバー情報も更新
+        await upsertGroupMember(db, {
+          groupId: group.id,
+          lineUserId: userId,
+          displayName,
+        });
+      }
+    }
 
     return;
   }

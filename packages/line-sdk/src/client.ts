@@ -140,6 +140,36 @@ export class LineClient {
     );
   }
 
+  // ─── Group ───────────────────────────────────────────────────────────────
+
+  async getGroupSummary(groupId: string): Promise<{ groupId: string; groupName: string; pictureUrl?: string }> {
+    return this.request<{ groupId: string; groupName: string; pictureUrl?: string }>(
+      `/group/${encodeURIComponent(groupId)}/summary`,
+      {},
+      'GET',
+    );
+  }
+
+  async getGroupMemberIds(groupId: string): Promise<{ memberIds: string[]; next?: string }> {
+    return this.request<{ memberIds: string[]; next?: string }>(
+      `/group/${encodeURIComponent(groupId)}/members/ids`,
+      {},
+      'GET',
+    );
+  }
+
+  async getGroupMemberProfile(groupId: string, userId: string): Promise<UserProfile> {
+    return this.request<UserProfile>(
+      `/group/${encodeURIComponent(groupId)}/member/${encodeURIComponent(userId)}`,
+      {},
+      'GET',
+    );
+  }
+
+  async leaveGroup(groupId: string): Promise<void> {
+    await this.request(`/group/${encodeURIComponent(groupId)}/leave`, {});
+  }
+
   // ─── Helpers ──────────────────────────────────────────────────────────────
 
   async pushTextMessage(to: string, text: string): Promise<void> {

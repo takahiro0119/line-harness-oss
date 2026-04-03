@@ -503,4 +503,132 @@ export const api = {
     regenerateKey: (id: string) =>
       fetchApi<ApiResponse<{ apiKey: string }>>(`/api/staff/${id}/regenerate-key`, { method: 'POST' }),
   },
+
+  // ── Groups & Attendance ──────────────────────────────────────────────────
+  groups: {
+    list: (params?: { accountId?: string }) => {
+      const query = params?.accountId ? '?lineAccountId=' + params.accountId : ''
+      return fetchApi<ApiResponse<GroupItem[]>>('/api/groups' + query)
+    },
+    get: (id: string) =>
+      fetchApi<ApiResponse<GroupDetail>>(`/api/groups/${id}`),
+    update: (id: string, data: { name?: string; isActive?: boolean }) =>
+      fetchApi<ApiResponse<unknown>>(`/api/groups/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    delete: (id: string) =>
+      fetchApi<ApiResponse<null>>(`/api/groups/${id}`, { method: 'DELETE' }),
+    send: (id: string, data: { content: string; messageType?: string }) =>
+      fetchApi<ApiResponse<{ sent: boolean }>>(`/api/groups/${id}/send`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    messages: (id: string, params?: { limit?: number; offset?: number }) => {
+      const query = new URLSearchParams()
+      if (params?.limit) query.set('limit', String(params.limit))
+      if (params?.offset) query.set('offset', String(params.offset))
+      return fetchApi<ApiResponse<GroupMessage[]>>(`/api/groups/${id}/messages?${query}`)
+    },
+    // Attendance
+    attendanceSchedules: (groupId: string) =>
+      fetchApi<ApiResponse<AttendanceScheduleItem[]>>(`/api/groups/${groupId}/attendance/schedules`),
+    createAttendanceSchedule: (groupId: string, data: { name: string; message?: string; cronExpression?: string }) =>
+      fetchApi<ApiResponse<AttendanceScheduleItem>>(`/api/groups/${groupId}/attendance/schedules`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    updateAttendanceSchedule: (scheduleId: string, data: { name?: string; message?: string; cronExpression?: string; isActive?: boolean }) =>
+      fetchApi<ApiResponse<unknown>>(`/api/attendance/schedules/${scheduleId}`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    deleteAttendanceSchedule: (scheduleId: string) =>
+      fetchApi<ApiResponse<null>>(`/api/attendance/schedules/${scheduleId}`, { method: 'DELETE' }),
+    attendanceRecords: (groupId: string, params?: { date?: string; scheduleId?: string; status?: string }) => {
+      const query = new URLSearchParams()
+      if (params?.date) query.set('date', params.date)
+      if (params?.scheduleId) query.set('scheduleId', params.scheduleId)
+      if (params?.status) query.set('status', params.status)
+      return fetchApi<ApiResponse<AttendanceRecordItem[]>>(`/api/groups/${groupId}/attendance/records?${query}`)
+    },
+    attendanceSummary: (groupId: string, params?: { startDate?: string; endDate?: string }) => {
+      const query = new URLSearchParams()
+      if (params?.startDate) query.set('startDate', params.startDate)
+      if (params?.endDate) query.set('endDate', params.endDate)
+      return fetchApi<ApiResponse<AttendanceSummaryItem[]>>(`/api/groups/${groupId}/attendance/summary?${query}`)
+    },
+    sendAttendance: (groupId: string, scheduleId: string) =>
+      fetchApi<ApiResponse<{ sent: boolean; memberCount: number; targetDate: string }>>(`/api/groups/${groupId}/attendance/send`, {
+        method: 'POST',
+        body: JSON.stringify({ scheduleId }),
+      }),
+  },
+}
+
+// ── Group Types ─────────────────────────────────────────────────────────────
+export type GroupItem = {
+  id: string
+  lineGroupId: string
+  lineAccountId: string | null
+  name: string | null
+  memberCount: number
+  isActive: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export type GroupMember = {
+  id: string
+  lineUserId: string
+  displayName: string | null
+  pictureUrl: string | null
+  role: string
+  joinedAt: string
+}
+
+export type GroupDetail = GroupItem & { members: GroupMember[] }
+
+export type GroupMessage = {
+  id: string
+  group_id: string
+  line_user_id: string | null
+  direction: 'incoming' | 'outgoing'
+  message_type: string
+  content: string
+  created_at: string
+}
+
+export type AttendanceScheduleItem = {
+  id: string
+  groupId: string
+  name: string
+  message: string
+  cronExpression: string
+  isActive: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export type AttendanceRecordItem = {
+  id: string
+  scheduleId: string
+  groupId: string
+  lineUserId: string
+  displayName: string | null
+  targetDate: string
+  status: 'pending' | 'present' | 'absent' | 'late' | 'other'
+  rawReply: string | null
+  repliedAt: string | null
+  createdAt: string
+}
+
+export type AttendanceSummaryItem = {
+  targetDate: string
+  total: number
+  present: number
+  absent: number
+  late: number
+  pending: number
+  other: number
 }

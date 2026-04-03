@@ -129,11 +129,39 @@ export interface PostbackEvent extends BaseEvent {
   };
 }
 
+export interface JoinEvent extends BaseEvent {
+  type: 'join';
+  replyToken: string;
+  source: GroupSource | RoomSource;
+}
+
+export interface LeaveEvent extends BaseEvent {
+  type: 'leave';
+  source: GroupSource | RoomSource;
+}
+
+export interface MemberJoinedEvent extends BaseEvent {
+  type: 'memberJoined';
+  replyToken: string;
+  source: GroupSource | RoomSource;
+  joined: { members: { type: 'user'; userId: string }[] };
+}
+
+export interface MemberLeftEvent extends BaseEvent {
+  type: 'memberLeft';
+  source: GroupSource | RoomSource;
+  left: { members: { type: 'user'; userId: string }[] };
+}
+
 export type WebhookEvent =
   | MessageEvent
   | FollowEvent
   | UnfollowEvent
-  | PostbackEvent;
+  | PostbackEvent
+  | JoinEvent
+  | LeaveEvent
+  | MemberJoinedEvent
+  | MemberLeftEvent;
 
 export interface WebhookRequestBody {
   destination: string;

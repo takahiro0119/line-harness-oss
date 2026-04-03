@@ -1,0 +1,8 @@
+{
+  "buildCommand": "pnpm --filter @line-crm/shared build && pnpm --filter web build",
+  "outputDirectory": "apps/web/out",
+  "installCommand": "pnpm install",
+  "framework": null,
+  "cleanUrls": true,
+  "trailingSlash": false
+}
