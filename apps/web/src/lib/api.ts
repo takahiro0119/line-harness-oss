@@ -563,6 +563,38 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ scheduleId }),
       }),
+
+    // ── 勤怠打刻 ──
+    clockSettings: (groupId: string) =>
+      fetchApi<ApiResponse<ClockSettings | null>>(`/api/groups/${groupId}/clock/settings`),
+    updateClockSettings: (groupId: string, data: Partial<ClockSettingsInput>) =>
+      fetchApi<ApiResponse<unknown>>(`/api/groups/${groupId}/clock/settings`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    clockShifts: (groupId: string) =>
+      fetchApi<ApiResponse<ShiftPatternItem[]>>(`/api/groups/${groupId}/clock/shifts`),
+    updateClockShift: (groupId: string, data: { lineUserId?: string | null; patternType?: string; workDays?: string; excludeHolidays?: boolean }) =>
+      fetchApi<ApiResponse<ShiftPatternItem[]>>(`/api/groups/${groupId}/clock/shifts`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+    deleteClockShift: (shiftId: string) =>
+      fetchApi<ApiResponse<null>>(`/api/clock/shifts/${shiftId}`, { method: 'DELETE' }),
+    clockRecords: (groupId: string, params?: { date?: string; startDate?: string; endDate?: string }) => {
+      const query = new URLSearchParams()
+      if (params?.date) query.set('date', params.date)
+      if (params?.startDate) query.set('startDate', params.startDate)
+      if (params?.endDate) query.set('endDate', params.endDate)
+      return fetchApi<ApiResponse<ClockRecordItem[]>>(`/api/groups/${groupId}/clock/records?${query}`)
+    },
+    createClockRecord: (groupId: string, data: { lineUserId: string; displayName?: string; targetDate: string; clockIn?: string; clockOut?: string }) =>
+      fetchApi<ApiResponse<{ recorded: boolean }>>(`/api/groups/${groupId}/clock/records`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    monthlyConfirmations: (groupId: string, month: string) =>
+      fetchApi<ApiResponse<MonthlyConfirmationItem[]>>(`/api/groups/${groupId}/clock/monthly?month=${month}`),
   },
 }
 
@@ -631,4 +663,62 @@ export type AttendanceSummaryItem = {
   late: number
   pending: number
   other: number
+}
+
+// ── 勤怠打刻 Types ────────────────────────────────────────────────────────
+
+export type ClockSettings = {
+  id: string
+  groupId: string
+  isEnabled: boolean
+  clockInTime: string
+  clockInReminderTime: string
+  clockOutTime: string
+  clockOutReminderTime: string
+  monthlyConfirmDay: number
+}
+
+export type ClockSettingsInput = {
+  isEnabled: boolean
+  clockInTime: string
+  clockInReminderTime: string
+  clockOutTime: string
+  clockOutReminderTime: string
+  monthlyConfirmDay: number
+}
+
+export type ShiftPatternItem = {
+  id: string
+  groupId: string
+  lineUserId: string | null
+  patternType: 'weekday' | 'custom'
+  workDays: string
+  excludeHolidays: boolean
+}
+
+export type ClockRecordItem = {
+  id: string
+  groupId: string
+  lineUserId: string
+  displayName: string | null
+  targetDate: string
+  clockIn: string | null
+  clockOut: string | null
+  workHours: number | null
+  clockInSource: string | null
+  clockOutSource: string | null
+}
+
+export type MonthlyConfirmationItem = {
+  id: string
+  groupId: string
+  lineUserId: string
+  displayName: string | null
+  targetMonth: string
+  totalDays: number | null
+  totalHours: number | null
+  status: 'pending' | 'confirmed' | 'revision_requested'
+  sentAt: string | null
+  confirmedAt: string | null
+  revisionNote: string | null
 }

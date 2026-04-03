@@ -6,6 +6,7 @@ import { processStepDeliveries } from './services/step-delivery.js';
 import { processScheduledBroadcasts } from './services/broadcast.js';
 import { processReminderDeliveries } from './services/reminder-delivery.js';
 import { checkAccountHealth } from './services/ban-monitor.js';
+import { processAttendanceClock } from './services/attendance-cron.js';
 import { authMiddleware } from './middleware/auth.js';
 import { webhook } from './routes/webhook.js';
 import { friends } from './routes/friends.js';
@@ -161,6 +162,12 @@ async function scheduled(
     );
   }
   jobs.push(checkAccountHealth(env.DB));
+
+  // 勤怠打刻の定期処理（全アカウント共通でDB参照）
+  for (const token of activeTokens) {
+    const lineClient = new LineClient(token);
+    jobs.push(processAttendanceClock(env.DB, lineClient));
+  }
 
   await Promise.allSettled(jobs);
 }

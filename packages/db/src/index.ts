@@ -23,6 +23,8 @@ export * from './forms';
 export * from './ad-platforms';
 export * from './staff';
 export * from './groups';
+export * from './attendance';
+export * from './holidays';
 
 /**
  * Thin wrapper around D1Database.

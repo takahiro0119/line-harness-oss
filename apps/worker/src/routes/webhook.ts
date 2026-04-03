@@ -22,6 +22,19 @@ import {
   getGroupMembers,
   upsertAttendanceRecord,
   parseAttendanceReply,
+  // 勤怠打刻
+  getAttendanceSettings,
+  upsertClockIn,
+  upsertClockOut,
+  getPendingReminder,
+  resolveClockReminder,
+  parseTimeText,
+  calcMonthlySummary,
+  confirmMonthly,
+  requestMonthlyRevision,
+  getClockRecord,
+  getClockRecordsByMonth,
+  upsertMonthlyConfirmation,
 } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
@@ -459,6 +472,86 @@ async function handleEvent(
     return;
   }
 
+  // ─── Postback イベント（勤怠打刻ボタン・月次確認） ─────────────────────────
+  if (event.type === 'postback') {
+    const userId = event.source.type === 'user' ? event.source.userId
+      : event.source.type === 'group' ? event.source.userId
+      : undefined;
+    if (!userId) return;
+
+    const data = new URLSearchParams(event.postback.data);
+    const action = data.get('action');
+
+    // グループ内のpostback
+    if (event.source.type === 'group') {
+      const lineGroupId = event.source.groupId;
+      const group = await getGroupByLineGroupId(db, lineGroupId);
+      if (!group) return;
+
+      // メンバー名取得
+      let displayName: string | null = null;
+      try {
+        const profile = await lineClient.getGroupMemberProfile(lineGroupId, userId);
+        displayName = profile.displayName;
+      } catch { /* ignore */ }
+
+      if (action === 'clock_in') {
+        const date = data.get('date');
+        if (!date) return;
+        const now = new Date(Date.now() + 9 * 60 * 60_000);
+        const currentTime = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}`;
+        await upsertClockIn(db, group.id, userId, displayName, date, currentTime, 'button');
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `${displayName || ''}さんの出勤を記録しました（${currentTime}）`,
+        }]);
+        return;
+      }
+
+      if (action === 'clock_out') {
+        const date = data.get('date');
+        if (!date) return;
+        const now = new Date(Date.now() + 9 * 60 * 60_000);
+        const currentTime = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}`;
+        await upsertClockOut(db, group.id, userId, displayName, date, currentTime, 'button');
+        const record = await getClockRecord(db, group.id, userId, date);
+        const hoursText = record?.work_hours ? `（稼働: ${record.work_hours}時間）` : '';
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `${displayName || ''}さんの退勤を記録しました（${currentTime}）${hoursText}`,
+        }]);
+        return;
+      }
+
+      if (action === 'monthly_confirm') {
+        const month = data.get('month');
+        if (!month) return;
+        // 個人のサマリーを計算して確認
+        const summary = await calcMonthlySummary(db, group.id, userId, month);
+        await upsertMonthlyConfirmation(db, group.id, userId, displayName, month, summary.totalDays, summary.totalHours);
+        await confirmMonthly(db, group.id, userId, month);
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `${displayName || ''}さんの${month}の稼働（${summary.totalDays}日 / ${summary.totalHours}時間）を確認しました。ありがとうございます！`,
+        }]);
+        return;
+      }
+
+      if (action === 'monthly_revision') {
+        const month = data.get('month');
+        if (!month) return;
+        await requestMonthlyRevision(db, group.id, userId, month);
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `${displayName || ''}さんの修正依頼を受け付けました。担当者より連絡いたします。`,
+        }]);
+        return;
+      }
+    }
+
+    return;
+  }
+
   // ─── グループ内メッセージ ─────────────────────────────────────────────────
   if (event.type === 'message' && event.message.type === 'text' && event.source.type === 'group') {
     const groupId = event.source.groupId;
@@ -493,7 +586,36 @@ async function handleEvent(
       content: incomingText,
     });
 
-    // 勤怠回答チェック: このグループにアクティブなスケジュールがあるか
+    // ─── 勤怠リマインド応答チェック（会話形式の時刻パース） ──────────────
+    const attendanceSettings = await getAttendanceSettings(db, group.id);
+    if (attendanceSettings?.is_enabled) {
+      const pendingReminder = await getPendingReminder(db, group.id, userId);
+      if (pendingReminder) {
+        const parsedTime = parseTimeText(incomingText);
+        if (parsedTime) {
+          const displayName = memberProfile?.displayName ?? null;
+          if (pendingReminder.reminder_type === 'clock_in') {
+            await upsertClockIn(db, group.id, userId, displayName, pendingReminder.target_date, parsedTime, 'reminder');
+            await lineClient.replyMessage(event.replyToken, [{
+              type: 'text',
+              text: `${displayName || ''}さんの出勤を${parsedTime}で記録しました`,
+            }]);
+          } else {
+            await upsertClockOut(db, group.id, userId, displayName, pendingReminder.target_date, parsedTime, 'reminder');
+            const record = await getClockRecord(db, group.id, userId, pendingReminder.target_date);
+            const hoursText = record?.work_hours ? `（稼働: ${record.work_hours}時間）` : '';
+            await lineClient.replyMessage(event.replyToken, [{
+              type: 'text',
+              text: `${displayName || ''}さんの退勤を${parsedTime}で記録しました${hoursText}`,
+            }]);
+          }
+          await resolveClockReminder(db, pendingReminder.id);
+          return;
+        }
+      }
+    }
+
+    // 勤怠回答チェック: このグループにアクティブなスケジュールがあるか（既存の出欠確認）
     const schedules = await getAttendanceSchedules(db, group.id);
     const activeSchedules = schedules.filter(s => s.is_active);
 
@@ -505,11 +627,7 @@ async function handleEvent(
         const targetDate = now.toISOString().slice(0, 10);
 
         // メンバーの表示名取得
-        let displayName: string | null = null;
-        try {
-          const profile = await lineClient.getGroupMemberProfile(groupId, userId);
-          displayName = profile.displayName;
-        } catch { /* ignore */ }
+        const displayName = memberProfile?.displayName ?? null;
 
         // 最初のアクティブスケジュールに対して記録
         const schedule = activeSchedules[0];
@@ -524,11 +642,13 @@ async function handleEvent(
         });
 
         // メンバー情報も更新
-        await upsertGroupMember(db, {
-          groupId: group.id,
-          lineUserId: userId,
-          displayName,
-        });
+        if (displayName) {
+          await upsertGroupMember(db, {
+            groupId: group.id,
+            lineUserId: userId,
+            displayName,
+          });
+        }
       }
     }
 

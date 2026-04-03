@@ -17,6 +17,18 @@ import {
   upsertAttendanceRecord,
   logGroupMessage,
   jstNow,
+  // 勤怠打刻
+  getAttendanceSettings,
+  upsertAttendanceSettings,
+  getShiftPatterns,
+  upsertShiftPattern,
+  deleteShiftPattern,
+  getClockRecordsByGroup,
+  getClockRecordsByMonth,
+  upsertClockIn,
+  upsertClockOut,
+  getMonthlyConfirmations,
+  calcMonthlySummary,
 } from '@line-crm/db';
 import type { Env } from '../index.js';
 
@@ -262,6 +274,164 @@ groups.post('/api/groups/:id/attendance/send', async (c) => {
   }
 
   return c.json({ success: true, data: { sent: true, memberCount: members.length, targetDate } });
+});
+
+// ─── 勤怠打刻 設定 ──────────────────────────────────────────────────────────
+
+groups.get('/api/groups/:id/clock/settings', async (c) => {
+  const db = c.env.DB;
+  const settings = await getAttendanceSettings(db, c.req.param('id'));
+  if (!settings) return c.json({ success: true, data: null });
+  return c.json({
+    success: true,
+    data: {
+      id: settings.id,
+      groupId: settings.group_id,
+      isEnabled: !!settings.is_enabled,
+      clockInTime: settings.clock_in_time,
+      clockInReminderTime: settings.clock_in_reminder_time,
+      clockOutTime: settings.clock_out_time,
+      clockOutReminderTime: settings.clock_out_reminder_time,
+      monthlyConfirmDay: settings.monthly_confirm_day,
+    },
+  });
+});
+
+groups.put('/api/groups/:id/clock/settings', async (c) => {
+  const db = c.env.DB;
+  const groupId = c.req.param('id');
+  const body = await c.req.json<{
+    isEnabled?: boolean;
+    clockInTime?: string;
+    clockInReminderTime?: string;
+    clockOutTime?: string;
+    clockOutReminderTime?: string;
+    monthlyConfirmDay?: number;
+  }>();
+  await upsertAttendanceSettings(db, groupId, {
+    is_enabled: body.isEnabled !== undefined ? (body.isEnabled ? 1 : 0) : undefined,
+    clock_in_time: body.clockInTime,
+    clock_in_reminder_time: body.clockInReminderTime,
+    clock_out_time: body.clockOutTime,
+    clock_out_reminder_time: body.clockOutReminderTime,
+    monthly_confirm_day: body.monthlyConfirmDay,
+  });
+  const settings = await getAttendanceSettings(db, groupId);
+  return c.json({ success: true, data: settings });
+});
+
+// ─── シフトパターン ──────────────────────────────────────────────────────────
+
+groups.get('/api/groups/:id/clock/shifts', async (c) => {
+  const db = c.env.DB;
+  const shifts = await getShiftPatterns(db, c.req.param('id'));
+  return c.json({
+    success: true,
+    data: shifts.map((s) => ({
+      id: s.id,
+      groupId: s.group_id,
+      lineUserId: s.line_user_id,
+      patternType: s.pattern_type,
+      workDays: s.work_days,
+      excludeHolidays: !!s.exclude_holidays,
+    })),
+  });
+});
+
+groups.put('/api/groups/:id/clock/shifts', async (c) => {
+  const db = c.env.DB;
+  const groupId = c.req.param('id');
+  const body = await c.req.json<{
+    lineUserId?: string | null;
+    patternType?: string;
+    workDays?: string;
+    excludeHolidays?: boolean;
+  }>();
+  await upsertShiftPattern(db, groupId, body.lineUserId ?? null, {
+    patternType: body.patternType,
+    workDays: body.workDays,
+    excludeHolidays: body.excludeHolidays !== undefined ? (body.excludeHolidays ? 1 : 0) : undefined,
+  });
+  const shifts = await getShiftPatterns(db, groupId);
+  return c.json({ success: true, data: shifts });
+});
+
+groups.delete('/api/clock/shifts/:id', async (c) => {
+  const db = c.env.DB;
+  await deleteShiftPattern(db, c.req.param('id'));
+  return c.json({ success: true, data: null });
+});
+
+// ─── 打刻記録 ────────────────────────────────────────────────────────────────
+
+groups.get('/api/groups/:id/clock/records', async (c) => {
+  const db = c.env.DB;
+  const groupId = c.req.param('id');
+  const date = c.req.query('date');
+  const startDate = c.req.query('startDate');
+  const endDate = c.req.query('endDate');
+  const records = await getClockRecordsByGroup(db, groupId, date || undefined, startDate || undefined, endDate || undefined);
+  return c.json({
+    success: true,
+    data: records.map((r) => ({
+      id: r.id,
+      groupId: r.group_id,
+      lineUserId: r.line_user_id,
+      displayName: r.display_name,
+      targetDate: r.target_date,
+      clockIn: r.clock_in,
+      clockOut: r.clock_out,
+      workHours: r.work_hours,
+      clockInSource: r.clock_in_source,
+      clockOutSource: r.clock_out_source,
+    })),
+  });
+});
+
+// 手動打刻（管理画面から）
+groups.post('/api/groups/:id/clock/records', async (c) => {
+  const db = c.env.DB;
+  const groupId = c.req.param('id');
+  const body = await c.req.json<{
+    lineUserId: string;
+    displayName?: string;
+    targetDate: string;
+    clockIn?: string;
+    clockOut?: string;
+  }>();
+  if (body.clockIn) {
+    await upsertClockIn(db, groupId, body.lineUserId, body.displayName || null, body.targetDate, body.clockIn, 'manual');
+  }
+  if (body.clockOut) {
+    await upsertClockOut(db, groupId, body.lineUserId, body.displayName || null, body.targetDate, body.clockOut, 'manual');
+  }
+  return c.json({ success: true, data: { recorded: true } });
+});
+
+// ─── 月次確認 ────────────────────────────────────────────────────────────────
+
+groups.get('/api/groups/:id/clock/monthly', async (c) => {
+  const db = c.env.DB;
+  const groupId = c.req.param('id');
+  const month = c.req.query('month');
+  if (!month) return c.json({ success: false, error: 'month query parameter required' }, 400);
+  const confirmations = await getMonthlyConfirmations(db, groupId, month);
+  return c.json({
+    success: true,
+    data: confirmations.map((mc) => ({
+      id: mc.id,
+      groupId: mc.group_id,
+      lineUserId: mc.line_user_id,
+      displayName: mc.display_name,
+      targetMonth: mc.target_month,
+      totalDays: mc.total_days,
+      totalHours: mc.total_hours,
+      status: mc.status,
+      sentAt: mc.sent_at,
+      confirmedAt: mc.confirmed_at,
+      revisionNote: mc.revision_note,
+    })),
+  });
 });
 
 export { groups };
