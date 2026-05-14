@@ -665,6 +665,83 @@ async function handleEvent(
         }]);
         return;
       }
+
+      if (action === 'richmenu_check_hours') {
+        const currentMonth = now.toISOString().slice(0, 7);
+        const summary = await calcFriendMonthlySummary(db, friend.id, currentMonth);
+        const { getFriendClockRecords } = await import('@line-crm/db');
+        const records = await getFriendClockRecords(db, {
+          friendId: friend.id,
+          startDate: currentMonth + '-01',
+          endDate: now.toISOString().slice(0, 10),
+        });
+
+        // 直近の打刻一覧（最大10件）
+        const recentRecords = records.slice(0, 10);
+        const recordLines = recentRecords.map(r => {
+          const clockIn = r.clock_in || '--:--';
+          const clockOut = r.clock_out || '--:--';
+          const hours = r.work_hours != null ? `${r.work_hours}h` : '-';
+          return { date: r.target_date.slice(5), clockIn, clockOut, hours };
+        });
+
+        const flexMessage = {
+          type: 'flex' as const,
+          altText: `${currentMonth} 稼働状況`,
+          contents: {
+            type: 'bubble',
+            body: {
+              type: 'box', layout: 'vertical', paddingAll: '20px',
+              contents: [
+                { type: 'text', text: '📊 今月の稼働状況', size: 'lg', weight: 'bold', color: '#1e293b' },
+                { type: 'text', text: currentMonth, size: 'sm', color: '#64748b', margin: 'sm' },
+                { type: 'separator', margin: 'lg' },
+                {
+                  type: 'box', layout: 'horizontal', margin: 'lg', paddingAll: '12px', backgroundColor: '#f0fdf4', cornerRadius: 'md',
+                  contents: [
+                    { type: 'box', layout: 'vertical', flex: 1, contents: [
+                      { type: 'text', text: '稼働日数', size: 'xs', color: '#64748b', align: 'center' },
+                      { type: 'text', text: `${summary.totalDays}日`, size: 'xl', weight: 'bold', color: '#1e293b', align: 'center', margin: 'sm' },
+                    ]},
+                    { type: 'separator' },
+                    { type: 'box', layout: 'vertical', flex: 1, contents: [
+                      { type: 'text', text: '合計時間', size: 'xs', color: '#64748b', align: 'center' },
+                      { type: 'text', text: `${summary.totalHours}h`, size: 'xl', weight: 'bold', color: '#1e293b', align: 'center', margin: 'sm' },
+                    ]},
+                  ],
+                },
+                // 打刻一覧ヘッダー
+                ...(recordLines.length > 0 ? [
+                  { type: 'text', text: '直近の打刻', size: 'sm', weight: 'bold', color: '#475569', margin: 'lg' },
+                  {
+                    type: 'box', layout: 'horizontal', margin: 'sm', paddingBottom: '4px',
+                    contents: [
+                      { type: 'text', text: '日付', size: 'xxs', color: '#94a3b8', flex: 2 },
+                      { type: 'text', text: '出勤', size: 'xxs', color: '#94a3b8', flex: 2, align: 'center' },
+                      { type: 'text', text: '退勤', size: 'xxs', color: '#94a3b8', flex: 2, align: 'center' },
+                      { type: 'text', text: '時間', size: 'xxs', color: '#94a3b8', flex: 1, align: 'end' },
+                    ],
+                  },
+                  ...recordLines.map(r => ({
+                    type: 'box', layout: 'horizontal', paddingTop: '4px', paddingBottom: '4px',
+                    contents: [
+                      { type: 'text', text: r.date, size: 'xs', color: '#1e293b', flex: 2 },
+                      { type: 'text', text: r.clockIn, size: 'xs', color: '#475569', flex: 2, align: 'center' },
+                      { type: 'text', text: r.clockOut, size: 'xs', color: '#475569', flex: 2, align: 'center' },
+                      { type: 'text', text: r.hours, size: 'xs', color: '#1e293b', weight: 'bold', flex: 1, align: 'end' },
+                    ],
+                  })),
+                ] : [
+                  { type: 'text', text: '今月の打刻記録はまだありません', size: 'sm', color: '#94a3b8', margin: 'lg', align: 'center' },
+                ]),
+              ],
+            },
+          },
+        };
+
+        await lineClient.replyMessage(event.replyToken, [flexMessage]);
+        return;
+      }
     }
 
     return;

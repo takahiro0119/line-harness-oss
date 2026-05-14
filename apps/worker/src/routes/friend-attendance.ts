@@ -214,7 +214,7 @@ friendAttendance.get('/api/attendance/monthly', async (c) => {
 friendAttendance.post('/api/attendance/richmenu/setup', async (c) => {
   const lineClient = new LineClient(c.env.LINE_CHANNEL_ACCESS_TOKEN);
 
-  // リッチメニュー定義: 2分割（出勤 / 退勤）
+  // リッチメニュー定義: 3分割（出勤 / 退勤 / 稼働確認）
   const richMenu = {
     size: { width: 2500, height: 843 },
     selected: true,
@@ -222,12 +222,16 @@ friendAttendance.post('/api/attendance/richmenu/setup', async (c) => {
     chatBarText: '勤怠打刻',
     areas: [
       {
-        bounds: { x: 0, y: 0, width: 1250, height: 843 },
+        bounds: { x: 0, y: 0, width: 833, height: 843 },
         action: { type: 'postback' as const, data: 'action=richmenu_clock_in', label: '出勤' },
       },
       {
-        bounds: { x: 1250, y: 0, width: 1250, height: 843 },
+        bounds: { x: 833, y: 0, width: 834, height: 843 },
         action: { type: 'postback' as const, data: 'action=richmenu_clock_out', label: '退勤' },
+      },
+      {
+        bounds: { x: 1667, y: 0, width: 833, height: 843 },
+        action: { type: 'postback' as const, data: 'action=richmenu_check_hours', label: '稼働確認' },
       },
     ],
   };
