@@ -596,6 +596,36 @@ export const api = {
     monthlyConfirmations: (groupId: string, month: string) =>
       fetchApi<ApiResponse<MonthlyConfirmationItem[]>>(`/api/groups/${groupId}/clock/monthly?month=${month}`),
   },
+
+  // ── 1:1 勤怠管理 ──────────────────────────────────────────────────────
+  attendance: {
+    config: (lineAccountId?: string) =>
+      fetchApi<ApiResponse<FriendAttendanceConfig | null>>(`/api/attendance/config${lineAccountId ? '?lineAccountId=' + lineAccountId : ''}`),
+    updateConfig: (data: Partial<FriendAttendanceConfigInput>) =>
+      fetchApi<ApiResponse<unknown>>('/api/attendance/config', { method: 'PUT', body: JSON.stringify(data) }),
+    shifts: () =>
+      fetchApi<ApiResponse<FriendShiftItem[]>>('/api/attendance/shifts'),
+    updateShift: (friendId: string, data: Partial<FriendShiftInput>) =>
+      fetchApi<ApiResponse<unknown>>(`/api/attendance/shifts/${friendId}`, { method: 'PUT', body: JSON.stringify(data) }),
+    deleteShift: (friendId: string) =>
+      fetchApi<ApiResponse<null>>(`/api/attendance/shifts/${friendId}`, { method: 'DELETE' }),
+    targets: (lineAccountId?: string) =>
+      fetchApi<ApiResponse<FriendAttendanceTarget[]>>(`/api/attendance/targets${lineAccountId ? '?lineAccountId=' + lineAccountId : ''}`),
+    records: (params?: { friendId?: string; date?: string; startDate?: string; endDate?: string }) => {
+      const query = new URLSearchParams()
+      if (params?.friendId) query.set('friendId', params.friendId)
+      if (params?.date) query.set('date', params.date)
+      if (params?.startDate) query.set('startDate', params.startDate)
+      if (params?.endDate) query.set('endDate', params.endDate)
+      return fetchApi<ApiResponse<FriendClockRecordItem[]>>(`/api/attendance/records?${query}`)
+    },
+    createRecord: (data: { friendId: string; lineUserId: string; displayName?: string; targetDate: string; clockIn?: string; clockOut?: string }) =>
+      fetchApi<ApiResponse<unknown>>('/api/attendance/records', { method: 'POST', body: JSON.stringify(data) }),
+    monthly: (month: string) =>
+      fetchApi<ApiResponse<FriendMonthlyConfItem[]>>(`/api/attendance/monthly?month=${month}`),
+    setupRichMenu: () =>
+      fetchApi<ApiResponse<{ richMenuId: string; message: string }>>('/api/attendance/richmenu/setup', { method: 'POST' }),
+  },
 }
 
 // ── Group Types ─────────────────────────────────────────────────────────────
@@ -713,6 +743,89 @@ export type MonthlyConfirmationItem = {
   id: string
   groupId: string
   lineUserId: string
+  displayName: string | null
+  targetMonth: string
+  totalDays: number | null
+  totalHours: number | null
+  status: 'pending' | 'confirmed' | 'revision_requested'
+  sentAt: string | null
+  confirmedAt: string | null
+  revisionNote: string | null
+}
+
+// ── 1:1 勤怠 Types ────────────────────────────────────────────────────
+
+export type FriendAttendanceConfig = {
+  id: string
+  lineAccountId: string | null
+  isEnabled: boolean
+  clockInTime: string
+  clockInReminderTime: string
+  clockOutTime: string
+  clockOutReminderTime: string
+  monthlyConfirmDay: number
+}
+
+export type FriendAttendanceConfigInput = {
+  lineAccountId?: string | null
+  isEnabled?: boolean
+  clockInTime?: string
+  clockInReminderTime?: string
+  clockOutTime?: string
+  clockOutReminderTime?: string
+  monthlyConfirmDay?: number
+}
+
+export type FriendShiftItem = {
+  id: string
+  friendId: string
+  patternType: 'default' | 'custom'
+  workDays: string
+  excludeHolidays: boolean
+  clockInTime: string | null
+  clockInReminderTime: string | null
+  clockOutTime: string | null
+  clockOutReminderTime: string | null
+  isExcluded: boolean
+}
+
+export type FriendShiftInput = {
+  patternType?: string
+  workDays?: string
+  excludeHolidays?: boolean
+  clockInTime?: string | null
+  clockInReminderTime?: string | null
+  clockOutTime?: string | null
+  clockOutReminderTime?: string | null
+  isExcluded?: boolean
+}
+
+export type FriendAttendanceTarget = {
+  friendId: string
+  lineUserId: string
+  displayName: string | null
+  clockInTime: string | null
+  clockOutTime: string | null
+  workDays: string
+  excludeHolidays: number
+}
+
+export type FriendClockRecordItem = {
+  id: string
+  friendId: string
+  lineUserId: string
+  displayName: string | null
+  targetDate: string
+  clockIn: string | null
+  clockOut: string | null
+  workHours: number | null
+  clockInSource: string | null
+  clockOutSource: string | null
+}
+
+export type FriendMonthlyConfItem = {
+  id: string
+  friendId: string
   displayName: string | null
   targetMonth: string
   totalDays: number | null

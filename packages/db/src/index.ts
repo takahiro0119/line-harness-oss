@@ -24,6 +24,7 @@ export * from './ad-platforms';
 export * from './staff';
 export * from './groups';
 export * from './attendance';
+export * from './friend-attendance';
 export * from './holidays';
 
 /**

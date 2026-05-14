@@ -6,7 +6,7 @@ import { processStepDeliveries } from './services/step-delivery.js';
 import { processScheduledBroadcasts } from './services/broadcast.js';
 import { processReminderDeliveries } from './services/reminder-delivery.js';
 import { checkAccountHealth } from './services/ban-monitor.js';
-import { processAttendanceClock } from './services/attendance-cron.js';
+import { processFriendAttendanceClock } from './services/friend-attendance-cron.js';
 import { authMiddleware } from './middleware/auth.js';
 import { webhook } from './routes/webhook.js';
 import { friends } from './routes/friends.js';
@@ -36,6 +36,7 @@ import { forms } from './routes/forms.js';
 import { adPlatforms } from './routes/ad-platforms.js';
 import { staff } from './routes/staff.js';
 import { groups } from './routes/groups.js';
+import { friendAttendance } from './routes/friend-attendance.js';
 
 export type Env = {
   Bindings: {
@@ -48,6 +49,7 @@ export type Env = {
     LINE_LOGIN_CHANNEL_ID: string;
     LINE_LOGIN_CHANNEL_SECRET: string;
     WORKER_URL: string;
+    ANTHROPIC_API_KEY?: string;
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
   };
   Variables: {
@@ -93,6 +95,7 @@ app.route('/', forms);
 app.route('/', adPlatforms);
 app.route('/', staff);
 app.route('/', groups);
+app.route('/', friendAttendance);
 
 // Short link: /r/:ref → landing page with LINE open button
 app.get('/r/:ref', (c) => {
@@ -163,10 +166,10 @@ async function scheduled(
   }
   jobs.push(checkAccountHealth(env.DB));
 
-  // 勤怠打刻の定期処理（全アカウント共通でDB参照）
+  // 1:1勤怠打刻の定期処理
   for (const token of activeTokens) {
     const lineClient = new LineClient(token);
-    jobs.push(processAttendanceClock(env.DB, lineClient));
+    jobs.push(processFriendAttendanceClock(env.DB, lineClient));
   }
 
   await Promise.allSettled(jobs);

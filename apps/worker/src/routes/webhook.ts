@@ -22,7 +22,7 @@ import {
   getGroupMembers,
   upsertAttendanceRecord,
   parseAttendanceReply,
-  // 勤怠打刻
+  // グループ勤怠（レガシー）
   getAttendanceSettings,
   upsertClockIn,
   upsertClockOut,
@@ -35,9 +35,22 @@ import {
   getClockRecord,
   getClockRecordsByMonth,
   upsertMonthlyConfirmation,
+  // 1:1勤怠
+  getAttendanceConfig,
+  getFriendClockRecord,
+  upsertFriendClockIn,
+  upsertFriendClockOut,
+  getFriendPendingReminder,
+  resolveFriendClockReminder,
+  calcFriendMonthlySummary,
+  upsertFriendMonthlyConfirmation,
+  confirmFriendMonthly,
+  requestFriendMonthlyRevision,
+  getFriendShift,
 } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
+import { handleGroupAIMessage } from '../services/group-ai.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
@@ -88,7 +101,7 @@ webhook.post('/webhook', async (c) => {
   const processingPromise = (async () => {
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin);
+        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.ANTHROPIC_API_KEY);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -107,6 +120,7 @@ async function handleEvent(
   lineAccessToken: string,
   lineAccountId: string | null = null,
   workerUrl?: string,
+  anthropicApiKey?: string,
 ): Promise<void> {
   if (event.type === 'follow') {
     const userId =
@@ -229,9 +243,35 @@ async function handleEvent(
       .bind(logId, friend.id, incomingText, now)
       .run();
 
+    // ─── 1:1 勤怠リマインド応答チェック ─────────────────────────────
+    const attendanceConfig = await getAttendanceConfig(db, lineAccountId);
+    if (attendanceConfig?.is_enabled) {
+      const pendingReminder = await getFriendPendingReminder(db, friend.id);
+      if (pendingReminder) {
+        const parsedTime = parseTimeText(incomingText);
+        if (parsedTime) {
+          if (pendingReminder.reminder_type === 'clock_in') {
+            await upsertFriendClockIn(db, friend.id, userId, friend.display_name, pendingReminder.target_date, parsedTime, 'reminder');
+            await lineClient.replyMessage(event.replyToken, [{
+              type: 'text', text: `出勤を${parsedTime}で記録しました`,
+            }]);
+          } else {
+            await upsertFriendClockOut(db, friend.id, userId, friend.display_name, pendingReminder.target_date, parsedTime, 'reminder');
+            const record = await getFriendClockRecord(db, friend.id, pendingReminder.target_date);
+            const hoursText = record?.work_hours ? `（稼働: ${record.work_hours}時間）` : '';
+            await lineClient.replyMessage(event.replyToken, [{
+              type: 'text', text: `退勤を${parsedTime}で記録しました${hoursText}`,
+            }]);
+          }
+          await resolveFriendClockReminder(db, pendingReminder.id);
+          return;
+        }
+      }
+    }
+
     // チャットを作成/更新（ユーザーの自発的メッセージのみ unread にする）
     // ボタンタップ等の自動応答キーワードは除外
-    const autoKeywords = ['料金', '機能', 'API', 'フォーム', 'ヘルプ', 'UUID', 'UUID連携について教えて', 'UUID連携を確認', '配信時間', '導入支援を希望します', 'アカウント連携を見る', '体験を完了する', 'BAN対策を見る', '連携確認'];
+    const autoKeywords = ['料金', '機能', 'API', 'フォーム', 'ヘルプ', 'UUID', 'UUID連携について教えて', 'UUID連携を確認', '配信時間', '導入支援を希望します', 'アカウント連携を見る', '体験を完了する', 'BAN対策を見る', '連携確認', '出勤します', '退勤します'];
     const isAutoKeyword = autoKeywords.some(k => incomingText === k);
     const isTimeCommand = /(?:配信時間|配信|届けて|通知)[はを]?\s*\d{1,2}\s*時/.test(incomingText);
     if (!isAutoKeyword && !isTimeCommand) {
@@ -549,6 +589,84 @@ async function handleEvent(
       }
     }
 
+    // ─── 1:1チャットのpostback（勤怠打刻） ────────────────────────────
+    if (event.source.type === 'user') {
+      const friend = await getFriendByLineUserId(db, userId);
+      if (!friend) return;
+
+      const now = new Date(Date.now() + 9 * 60 * 60_000);
+      const currentTime = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}`;
+
+      if (action === 'clock_in') {
+        const date = data.get('date') || now.toISOString().slice(0, 10);
+        await upsertFriendClockIn(db, friend.id, userId, friend.display_name, date, currentTime, 'button');
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `出勤を記録しました（${currentTime}）`,
+        }]);
+        return;
+      }
+
+      if (action === 'clock_out') {
+        const date = data.get('date') || now.toISOString().slice(0, 10);
+        await upsertFriendClockOut(db, friend.id, userId, friend.display_name, date, currentTime, 'button');
+        const record = await getFriendClockRecord(db, friend.id, date);
+        const hoursText = record?.work_hours ? `（稼働: ${record.work_hours}時間）` : '';
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `退勤を記録しました（${currentTime}）${hoursText}`,
+        }]);
+        return;
+      }
+
+      if (action === 'monthly_confirm') {
+        const month = data.get('month');
+        if (!month) return;
+        const summary = await calcFriendMonthlySummary(db, friend.id, month);
+        await upsertFriendMonthlyConfirmation(db, friend.id, friend.display_name, month, summary.totalDays, summary.totalHours);
+        await confirmFriendMonthly(db, friend.id, month);
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `${month}の稼働（${summary.totalDays}日 / ${summary.totalHours}時間）を確認しました。ありがとうございます！`,
+        }]);
+        return;
+      }
+
+      if (action === 'monthly_revision') {
+        const month = data.get('month');
+        if (!month) return;
+        await requestFriendMonthlyRevision(db, friend.id, month);
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `修正依頼を受け付けました。担当者より連絡いたします。`,
+        }]);
+        return;
+      }
+
+      // リッチメニューからの打刻
+      if (action === 'richmenu_clock_in') {
+        const date = now.toISOString().slice(0, 10);
+        await upsertFriendClockIn(db, friend.id, userId, friend.display_name, date, currentTime, 'richmenu');
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `出勤を記録しました（${currentTime}）`,
+        }]);
+        return;
+      }
+
+      if (action === 'richmenu_clock_out') {
+        const date = now.toISOString().slice(0, 10);
+        await upsertFriendClockOut(db, friend.id, userId, friend.display_name, date, currentTime, 'richmenu');
+        const record = await getFriendClockRecord(db, friend.id, date);
+        const hoursText = record?.work_hours ? `（稼働: ${record.work_hours}時間）` : '';
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `退勤を記録しました（${currentTime}）${hoursText}`,
+        }]);
+        return;
+      }
+    }
+
     return;
   }
 
@@ -648,6 +766,25 @@ async function handleEvent(
             lineUserId: userId,
             displayName,
           });
+        }
+        return;
+      }
+    }
+
+    // ─── AI勤怠アシスタント（勤怠照会等） ──────────────────────────────
+    if (anthropicApiKey && attendanceSettings?.is_enabled) {
+      // 勤怠関連のキーワードを含むメッセージのみAIに渡す
+      const attendanceKeywords = ['出勤', '退勤', '勤怠', '稼働', '打刻', '月次', '確認', 'データ', '一覧', '時間', '何日', '何時間'];
+      const isAttendanceQuery = attendanceKeywords.some(k => incomingText.includes(k));
+
+      if (isAttendanceQuery) {
+        try {
+          const aiResponse = await handleGroupAIMessage(db, group.id, incomingText, anthropicApiKey);
+          if (aiResponse) {
+            await lineClient.pushMessage(groupId, [{ type: 'text', text: aiResponse }]);
+          }
+        } catch (err) {
+          console.error('Group AI error:', err);
         }
       }
     }
