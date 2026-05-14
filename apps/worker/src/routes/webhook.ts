@@ -51,6 +51,7 @@ import {
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { handleGroupAIMessage } from '../services/group-ai.js';
+import { startOnboardingIfNeeded, handleOnboardingMessage } from '../services/onboarding.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
@@ -208,6 +209,17 @@ async function handleEvent(
       }
     }
 
+    // オンボーディング開始（流入経路に応じた登録フロー）
+    // ※ replyTokenはシナリオの即時配信で使われている可能性があるため、
+    //    シナリオで使われなかった場合のみオンボーディングで使用
+    if (friend.ref_code) {
+      try {
+        await startOnboardingIfNeeded(db, lineClient, friend.id, friend.ref_code, event.replyToken);
+      } catch (err) {
+        console.error('Onboarding start error:', err);
+      }
+    }
+
     // イベントバス発火: friend_add
     await fireEvent(db, 'friend_add', { friendId: friend.id, eventData: { displayName: friend.display_name } }, lineAccessToken, lineAccountId);
     return;
@@ -267,6 +279,14 @@ async function handleEvent(
           return;
         }
       }
+    }
+
+    // ─── オンボーディング会話チェック ───────────────────────────────
+    try {
+      const handled = await handleOnboardingMessage(db, lineClient, friend.id, incomingText, event.replyToken);
+      if (handled) return;
+    } catch (err) {
+      console.error('Onboarding message error:', err);
     }
 
     // チャットを作成/更新（ユーザーの自発的メッセージのみ unread にする）
