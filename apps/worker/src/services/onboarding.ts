@@ -11,6 +11,8 @@ import {
   updateOnboardingStep,
   getEntryRouteOnboardingFlow,
 } from '@line-crm/db';
+import { searchKintoneWorker } from './kintone.js';
+import type { KintoneWorker } from './kintone.js';
 
 /**
  * follow時に呼ばれる: 流入経路に応じてオンボーディングを開始
@@ -55,12 +57,13 @@ export async function handleOnboardingMessage(
   friendId: string,
   text: string,
   replyToken: string,
+  kintoneApiToken?: string,
 ): Promise<boolean> {
   const onboarding = await getFriendOnboarding(db, friendId);
   if (!onboarding || onboarding.completed) return false;
 
   if (onboarding.flow_type === 'bpo_worker') {
-    return handleBpoWorkerFlow(db, lineClient, friendId, text, replyToken, onboarding.step);
+    return handleBpoWorkerFlow(db, lineClient, friendId, text, replyToken, onboarding.step, kintoneApiToken);
   }
 
   return false;
@@ -73,6 +76,7 @@ async function handleBpoWorkerFlow(
   text: string,
   replyToken: string,
   currentStep: string,
+  kintoneApiToken?: string,
 ): Promise<boolean> {
   const trimmed = text.trim();
 
@@ -106,44 +110,93 @@ async function handleBpoWorkerFlow(
         return true;
       }
 
-      await updateOnboardingStep(db, friendId, 'complete', { birthday });
-
-      // 完了メッセージ
+      // Kintone 名寄せ
       const onboarding = await getFriendOnboarding(db, friendId);
-      await lineClient.replyMessage(replyToken, [{
-        type: 'flex',
-        altText: '登録完了',
-        contents: {
-          type: 'bubble',
-          body: {
-            type: 'box', layout: 'vertical', paddingAll: '20px',
-            contents: [
-              { type: 'text', text: '✅ 登録が完了しました', size: 'lg', weight: 'bold', color: '#1e293b' },
-              { type: 'separator', margin: 'lg' },
-              {
-                type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm',
-                contents: [
-                  {
-                    type: 'box', layout: 'horizontal',
-                    contents: [
+      const fullName = onboarding?.full_name || '';
+      let kintoneWorker: KintoneWorker | null = null;
+
+      if (kintoneApiToken) {
+        try {
+          kintoneWorker = await searchKintoneWorker(kintoneApiToken, fullName, birthday);
+        } catch (err) {
+          console.error('Kintone search error:', err);
+        }
+      }
+
+      if (kintoneWorker) {
+        // 名寄せ成功
+        await updateOnboardingStep(db, friendId, 'complete', {
+          birthday,
+          kintoneId: kintoneWorker.recordId,
+        });
+
+        await lineClient.replyMessage(replyToken, [{
+          type: 'flex',
+          altText: '登録完了',
+          contents: {
+            type: 'bubble',
+            body: {
+              type: 'box', layout: 'vertical', paddingAll: '20px',
+              contents: [
+                { type: 'text', text: '✅ 本人確認が完了しました', size: 'lg', weight: 'bold', color: '#1e293b' },
+                { type: 'separator', margin: 'lg' },
+                {
+                  type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm',
+                  contents: [
+                    { type: 'box', layout: 'horizontal', contents: [
                       { type: 'text', text: 'お名前', size: 'sm', color: '#64748b', flex: 2 },
-                      { type: 'text', text: onboarding?.full_name || '-', size: 'sm', color: '#1e293b', flex: 3 },
-                    ],
-                  },
-                  {
-                    type: 'box', layout: 'horizontal',
-                    contents: [
+                      { type: 'text', text: kintoneWorker.name, size: 'sm', color: '#1e293b', flex: 3 },
+                    ]},
+                    { type: 'box', layout: 'horizontal', contents: [
                       { type: 'text', text: '生年月日', size: 'sm', color: '#64748b', flex: 2 },
                       { type: 'text', text: birthday, size: 'sm', color: '#1e293b', flex: 3 },
-                    ],
-                  },
-                ],
-              },
-              { type: 'text', text: '勤怠管理の準備ができました。\n下のメニューから出勤・退勤の打刻ができます。', size: 'xs', color: '#64748b', wrap: true, margin: 'lg' },
-            ],
+                    ]},
+                  ],
+                },
+                { type: 'text', text: '稼働者情報との紐付けが完了しました。\n下のメニューから出勤・退勤の打刻ができます。', size: 'xs', color: '#64748b', wrap: true, margin: 'lg' },
+              ],
+            },
           },
-        },
-      }]);
+        }]);
+      } else {
+        // 名寄せ失敗
+        await updateOnboardingStep(db, friendId, 'complete', { birthday });
+
+        await lineClient.replyMessage(replyToken, [{
+          type: 'flex',
+          altText: '登録完了',
+          contents: {
+            type: 'bubble',
+            body: {
+              type: 'box', layout: 'vertical', paddingAll: '20px',
+              contents: [
+                { type: 'text', text: '📝 情報を受け付けました', size: 'lg', weight: 'bold', color: '#1e293b' },
+                { type: 'separator', margin: 'lg' },
+                {
+                  type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm',
+                  contents: [
+                    { type: 'box', layout: 'horizontal', contents: [
+                      { type: 'text', text: 'お名前', size: 'sm', color: '#64748b', flex: 2 },
+                      { type: 'text', text: fullName, size: 'sm', color: '#1e293b', flex: 3 },
+                    ]},
+                    { type: 'box', layout: 'horizontal', contents: [
+                      { type: 'text', text: '生年月日', size: 'sm', color: '#64748b', flex: 2 },
+                      { type: 'text', text: birthday, size: 'sm', color: '#1e293b', flex: 3 },
+                    ]},
+                  ],
+                },
+                {
+                  type: 'box', layout: 'vertical', margin: 'lg', paddingAll: '12px', backgroundColor: '#fef3c7', cornerRadius: 'md',
+                  contents: [
+                    { type: 'text', text: '⚠️ 稼働者情報との自動紐付けができませんでした。担当者が確認いたします。', size: 'xs', color: '#92400e', wrap: true },
+                  ],
+                },
+                { type: 'text', text: '下のメニューから出勤・退勤の打刻は可能です。', size: 'xs', color: '#64748b', wrap: true, margin: 'md' },
+              ],
+            },
+          },
+        }]);
+      }
       return true;
     }
 

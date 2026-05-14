@@ -50,6 +50,7 @@ export type Env = {
     LINE_LOGIN_CHANNEL_SECRET: string;
     WORKER_URL: string;
     ANTHROPIC_API_KEY?: string;
+    KINTONE_API_TOKEN?: string;
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
   };
   Variables: {

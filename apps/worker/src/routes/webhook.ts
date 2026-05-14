@@ -102,7 +102,7 @@ webhook.post('/webhook', async (c) => {
   const processingPromise = (async () => {
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.ANTHROPIC_API_KEY);
+        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.ANTHROPIC_API_KEY, c.env.KINTONE_API_TOKEN);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -122,6 +122,7 @@ async function handleEvent(
   lineAccountId: string | null = null,
   workerUrl?: string,
   anthropicApiKey?: string,
+  kintoneApiToken?: string,
 ): Promise<void> {
   if (event.type === 'follow') {
     const userId =
@@ -283,7 +284,7 @@ async function handleEvent(
 
     // ─── オンボーディング会話チェック ───────────────────────────────
     try {
-      const handled = await handleOnboardingMessage(db, lineClient, friend.id, incomingText, event.replyToken);
+      const handled = await handleOnboardingMessage(db, lineClient, friend.id, incomingText, event.replyToken, kintoneApiToken);
       if (handled) return;
     } catch (err) {
       console.error('Onboarding message error:', err);
