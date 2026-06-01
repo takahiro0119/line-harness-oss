@@ -38,6 +38,7 @@ import { staff } from './routes/staff.js';
 import { groups } from './routes/groups.js';
 import { friendAttendance } from './routes/friend-attendance.js';
 import { entryRoutes } from './routes/entry-routes.js';
+import { kintoneMirror } from './routes/kintone-mirror.js';
 
 export type Env = {
   Bindings: {
@@ -52,6 +53,7 @@ export type Env = {
     WORKER_URL: string;
     ANTHROPIC_API_KEY?: string;
     KINTONE_API_TOKEN?: string;
+    KINTONE_API_TOKEN_BPO?: string;  // BPO企業マスタ (appId=22)用
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
   };
   Variables: {
@@ -99,6 +101,7 @@ app.route('/', staff);
 app.route('/', groups);
 app.route('/', friendAttendance);
 app.route('/', entryRoutes);
+app.route('/', kintoneMirror);
 
 // Short link: /r/:ref → landing page with LINE open button
 app.get('/r/:ref', (c) => {
@@ -172,7 +175,7 @@ async function scheduled(
   // 1:1勤怠打刻の定期処理
   for (const token of activeTokens) {
     const lineClient = new LineClient(token);
-    jobs.push(processFriendAttendanceClock(env.DB, lineClient, env.KINTONE_API_TOKEN));
+    jobs.push(processFriendAttendanceClock(env.DB, lineClient, env.KINTONE_API_TOKEN, env.KINTONE_API_TOKEN_BPO));
   }
 
   await Promise.allSettled(jobs);

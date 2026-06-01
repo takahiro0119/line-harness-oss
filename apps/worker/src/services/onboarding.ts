@@ -13,8 +13,9 @@ import {
   upsertFriendShift,
   updateFriendKintoneStatus,
 } from '@line-crm/db';
-import { searchKintoneWorker } from './kintone.js';
-import type { KintoneWorker } from './kintone.js';
+import { searchKintoneWorkerByPhone } from './kintone.js';
+import type { KintoneAssignment } from './kintone.js';
+import { upsertFriendAssignment } from '@line-crm/db';
 
 /**
  * follow時に呼ばれる: 流入経路に応じてオンボーディングを開始
@@ -78,7 +79,7 @@ async function triggerOnboardingFlow(
     await sendMessage([
       {
         type: 'text',
-        text: '稼働状況の記録のため、いくつか確認させてください。\n\nまず、お名前をフルネームで教えてください。\n（例: 山田太郎）',
+        text: '稼働状況の記録のため、ご本人確認をさせてください。\n\nまず、お名前をフルネームで教えてください。\n（例: 山田太郎）',
       },
     ]);
     return true;
@@ -169,53 +170,68 @@ async function handleBpoWorkerFlow(
         return true;
       }
 
-      await updateOnboardingStep(db, friendId, 'ask_birthday', { fullName: trimmed });
+      await updateOnboardingStep(db, friendId, 'ask_phone', { fullName: trimmed });
       await lineClient.replyMessage(replyToken, [{
         type: 'text',
-        text: `${trimmed}さん、ありがとうございます。\n\n次に、生年月日を教えてください。\n（例: 1990-01-15 または 1990/1/15）`,
+        text: `${trimmed}さん、ありがとうございます。\n\n次に、ご登録のお電話番号を教えてください。\n（例: 090-1234-5678）`,
       }]);
       return true;
     }
 
-    case 'ask_birthday': {
-      // 生年月日をパース
-      const birthday = parseBirthday(trimmed);
-      if (!birthday) {
+    case 'ask_phone': {
+      // 電話番号を数字のみ正規化して検証
+      const phoneDigits = trimmed.replace(/[^0-9]/g, '');
+      if (phoneDigits.length < 10 || phoneDigits.length > 11) {
         await lineClient.replyMessage(replyToken, [{
           type: 'text',
-          text: '生年月日の形式が正しくありません。\n以下のいずれかの形式で入力してください。\n\n・1990-01-15\n・1990/1/15\n・19900115\n・平成2年1月15日',
+          text: '電話番号の形式が正しくありません。\n10桁か11桁の数字でご入力ください。\n（例: 09012345678 または 090-1234-5678）',
         }]);
         return true;
       }
 
-      // Kintone 名寄せ
       const onboarding = await getFriendOnboarding(db, friendId);
       const fullName = onboarding?.full_name || '';
-      let kintoneWorker: KintoneWorker | null = null;
+      let kintoneAssignment: KintoneAssignment | null = null;
 
       if (kintoneApiToken) {
         try {
-          kintoneWorker = await searchKintoneWorker(kintoneApiToken, fullName, birthday);
+          kintoneAssignment = await searchKintoneWorkerByPhone(kintoneApiToken, fullName, trimmed);
         } catch (err) {
-          console.error('Kintone search error:', err);
+          console.error('Kintone phone search error:', err);
         }
       }
 
-      if (kintoneWorker) {
-        // 名寄せ成功
+      if (kintoneAssignment) {
+        // 認証成功
         await updateOnboardingStep(db, friendId, 'complete', {
-          birthday,
-          kintoneId: kintoneWorker.recordId,
+          phone: phoneDigits,
+          kintoneId: kintoneAssignment.recordId,
         });
-        // 稼働対象として登録（既存稼働者）
         await upsertFriendShift(db, friendId, { pattern_type: 'default', work_days: '1,2,3,4,5', exclude_holidays: 1, is_excluded: 0 });
-        if (kintoneWorker.status) {
-          await updateFriendKintoneStatus(db, friendId, kintoneWorker.status);
+        if (kintoneAssignment.status) {
+          await updateFriendKintoneStatus(db, friendId, kintoneAssignment.status);
         }
+        // 参画情報を即時保存
+        await upsertFriendAssignment(db, friendId, {
+          current_case_name: kintoneAssignment.caseName,
+          current_billing_company: kintoneAssignment.billingCompany,
+          agency_name: kintoneAssignment.agencyName,
+          referrer: kintoneAssignment.referrer,
+          assignment_start_date: kintoneAssignment.startDate,
+        });
+
+        const detailRows: Array<{ label: string; value: string }> = [
+          { label: 'お名前', value: kintoneAssignment.name },
+          { label: '状況', value: kintoneAssignment.status || '-' },
+        ];
+        if (kintoneAssignment.billingCompany) detailRows.push({ label: '参画先', value: kintoneAssignment.billingCompany });
+        if (kintoneAssignment.caseName) detailRows.push({ label: '案件名', value: kintoneAssignment.caseName });
+        if (kintoneAssignment.agencyName) detailRows.push({ label: '代理店', value: kintoneAssignment.agencyName });
+        if (kintoneAssignment.startDate) detailRows.push({ label: '参画開始', value: kintoneAssignment.startDate });
 
         await lineClient.replyMessage(replyToken, [{
           type: 'flex',
-          altText: '登録完了',
+          altText: '本人確認が完了しました',
           contents: {
             type: 'bubble',
             body: {
@@ -225,31 +241,27 @@ async function handleBpoWorkerFlow(
                 { type: 'separator', margin: 'lg' },
                 {
                   type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm',
-                  contents: [
-                    { type: 'box', layout: 'horizontal', contents: [
-                      { type: 'text', text: 'お名前', size: 'sm', color: '#64748b', flex: 2 },
-                      { type: 'text', text: kintoneWorker.name, size: 'sm', color: '#1e293b', flex: 3 },
-                    ]},
-                    { type: 'box', layout: 'horizontal', contents: [
-                      { type: 'text', text: '生年月日', size: 'sm', color: '#64748b', flex: 2 },
-                      { type: 'text', text: birthday, size: 'sm', color: '#1e293b', flex: 3 },
-                    ]},
-                  ],
+                  contents: detailRows.map(row => ({
+                    type: 'box' as const, layout: 'horizontal' as const,
+                    contents: [
+                      { type: 'text' as const, text: row.label, size: 'sm' as const, color: '#64748b', flex: 2 },
+                      { type: 'text' as const, text: row.value, size: 'sm' as const, color: '#1e293b', flex: 3, wrap: true },
+                    ],
+                  })),
                 },
-                { type: 'text', text: '稼働者情報との紐付けが完了しました。\n下のメニューから稼働開始・終了の記録ができます。', size: 'xs', color: '#64748b', wrap: true, margin: 'lg' },
+                { type: 'text', text: '下のメニューから稼働開始・終了の記録ができます。', size: 'xs', color: '#64748b', wrap: true, margin: 'lg' },
               ],
             },
           },
         }]);
       } else {
-        // 名寄せ失敗
-        await updateOnboardingStep(db, friendId, 'complete', { birthday });
-        // 稼働対象として登録（名寄せ失敗でも対象にしておく：担当者確認後に紐付け）
+        // 認証失敗
+        await updateOnboardingStep(db, friendId, 'complete', { phone: phoneDigits });
         await upsertFriendShift(db, friendId, { pattern_type: 'default', work_days: '1,2,3,4,5', exclude_holidays: 1, is_excluded: 0 });
 
         await lineClient.replyMessage(replyToken, [{
           type: 'flex',
-          altText: '登録完了',
+          altText: '情報を受け付けました',
           contents: {
             type: 'bubble',
             body: {
@@ -265,8 +277,8 @@ async function handleBpoWorkerFlow(
                       { type: 'text', text: fullName, size: 'sm', color: '#1e293b', flex: 3 },
                     ]},
                     { type: 'box', layout: 'horizontal', contents: [
-                      { type: 'text', text: '生年月日', size: 'sm', color: '#64748b', flex: 2 },
-                      { type: 'text', text: birthday, size: 'sm', color: '#1e293b', flex: 3 },
+                      { type: 'text', text: '電話番号', size: 'sm', color: '#64748b', flex: 2 },
+                      { type: 'text', text: trimmed, size: 'sm', color: '#1e293b', flex: 3 },
                     ]},
                   ],
                 },
@@ -276,7 +288,6 @@ async function handleBpoWorkerFlow(
                     { type: 'text', text: '⚠️ 稼働者情報との自動紐付けができませんでした。担当者が確認いたします。', size: 'xs', color: '#92400e', wrap: true },
                   ],
                 },
-                { type: 'text', text: '下のメニューから稼働開始・終了の記録は可能です。', size: 'xs', color: '#64748b', wrap: true, margin: 'md' },
               ],
             },
           },

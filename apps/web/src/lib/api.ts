@@ -637,6 +637,46 @@ export const api = {
       fetchApi<ApiResponse<unknown>>(`/api/attendance/absences/${friendId}/${targetDate}`, { method: 'DELETE' }),
     exportUrl: (month: string) => `${API_URL}/api/attendance/export?month=${month}`,
   },
+
+  // ── Kintone ミラー (BPO企業マスタ + 稼働者参画情報) ──────────────────
+  kintone: {
+    companies: () =>
+      fetchApi<ApiResponse<KintoneCompanyItem[]>>('/api/kintone/companies'),
+    assignments: () =>
+      fetchApi<ApiResponse<KintoneAssignmentItem[]>>('/api/kintone/assignments'),
+    agencies: () =>
+      fetchApi<ApiResponse<{ agency: string; count: number }[]>>('/api/kintone/agencies'),
+  },
+}
+
+// ── Kintone Types ────────────────────────────────────────────────────
+export type KintoneCompanyItem = {
+  kintoneId: string
+  companyName: string | null
+  cases: string[]
+  caseSummaries: string[]
+  contactPerson: string | null
+  contactEmail: string | null
+  contactPhone: string | null
+  csPerson: string | null
+  salesPerson: string | null
+  workLocation: string | null
+  workHours: string | null
+  workEnvironment: string | null
+  activeWorkerCount: number
+  syncedAt: string
+}
+
+export type KintoneAssignmentItem = {
+  friendId: string
+  displayName: string | null
+  kintoneId: string | null
+  status: string | null
+  caseName: string | null
+  billingCompany: string | null
+  agencyName: string | null
+  referrer: string | null
+  assignmentStartDate: string | null
 }
 
 // ── Group Types ─────────────────────────────────────────────────────────────

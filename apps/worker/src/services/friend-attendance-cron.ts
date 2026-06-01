@@ -20,9 +20,12 @@ import {
   insertAbsenceAlert,
   getKintoneLinkedFriends,
   updateFriendKintoneStatus,
+  upsertFriendAssignment,
+  upsertKintoneCompany,
+  deleteKintoneCompaniesNotIn,
 } from '@line-crm/db';
 import type { AttendanceConfigRow, AttendanceTarget, FriendClockRecordRow } from '@line-crm/db';
-import { fetchKintoneWorkerStatuses } from './kintone.js';
+import { fetchKintoneWorkerStatuses, fetchKintoneAssignments, fetchAllKintoneCompanies } from './kintone.js';
 
 function jstTimeNow() {
   const now = new Date(Date.now() + 9 * 60 * 60_000);
@@ -272,8 +275,79 @@ async function checkLongAbsence(
 }
 
 /**
- * 朝の Kintone 状況同期 (8:45)
- * 紐付け済み友だちの「状況」を取得し friend_shifts.kintone_status に保存
+ * 朝の Kintone 同期 (8:40 + 8:45)
+ * - 8:40: BPO企業マスタ全件取得 → kintone_companies 洗い替え
+ * - 8:40: 紐付け済み友だちの参画情報 (状況/案件名/請求先企業/代理店/紹介者/参画決定日) を friend_shifts に同期
+ */
+export async function syncKintoneAssignmentsManual(db: D1Database, kintoneApiToken: string): Promise<void> {
+  return syncKintoneAssignments(db, kintoneApiToken);
+}
+
+export async function syncKintoneCompaniesManual(db: D1Database, bpoApiToken: string): Promise<void> {
+  return syncKintoneCompanies(db, bpoApiToken);
+}
+
+async function syncKintoneAssignments(db: D1Database, kintoneApiToken: string): Promise<void> {
+  const linked = await getKintoneLinkedFriends(db);
+  if (linked.length === 0) return;
+
+  const recordIds = [...new Set(linked.map(f => f.kintone_id))];
+  const assignments = await fetchKintoneAssignments(kintoneApiToken, recordIds);
+
+  for (const f of linked) {
+    const a = assignments.get(f.kintone_id);
+    if (!a) continue;
+    try {
+      if (a.status) await updateFriendKintoneStatus(db, f.friend_id, a.status);
+      await upsertFriendAssignment(db, f.friend_id, {
+        current_case_name: a.caseName || null,
+        current_billing_company: a.billingCompany || null,
+        agency_name: a.agencyName || null,
+        referrer: a.referrer || null,
+        assignment_start_date: a.startDate || null,
+      });
+    } catch (err) {
+      console.error(`Kintone assignment sync failed for friend ${f.friend_id}:`, err);
+    }
+  }
+}
+
+async function syncKintoneCompanies(db: D1Database, bpoApiToken: string): Promise<void> {
+  const companies = await fetchAllKintoneCompanies(bpoApiToken);
+  if (companies.length === 0) return;
+
+  for (const c of companies) {
+    try {
+      await upsertKintoneCompany(db, {
+        kintone_id: c.recordId,
+        company_name: c.companyName || null,
+        case_name_1: c.caseName1 || null,
+        case_name_2: c.caseName2 || null,
+        case_name_3: c.caseName3 || null,
+        case_summary_1: c.caseSummary1 || null,
+        case_summary_2: c.caseSummary2 || null,
+        case_summary_3: c.caseSummary3 || null,
+        contact_person: c.contactPerson || null,
+        contact_email: c.contactEmail || null,
+        contact_phone: c.contactPhone || null,
+        cs_person: c.csPerson || null,
+        sales_person: c.salesPerson || null,
+        work_location: c.workLocation || null,
+        work_hours: c.workHours || null,
+        work_environment: c.workEnvironment || null,
+        total_worker_count: c.totalWorkerCount || null,
+      });
+    } catch (err) {
+      console.error(`Kintone company upsert failed for ${c.recordId}:`, err);
+    }
+  }
+  // 削除分の掃除
+  await deleteKintoneCompaniesNotIn(db, companies.map(c => c.recordId));
+}
+
+/**
+ * 朝の Kintone 状況同期 (旧)
+ * 後方互換のため残す
  */
 async function syncKintoneStatuses(db: D1Database, kintoneApiToken: string): Promise<void> {
   const linked = await getKintoneLinkedFriends(db);
@@ -351,17 +425,29 @@ export async function processFriendAttendanceClock(
   db: D1Database,
   lineClient: LineClient,
   kintoneApiToken?: string,
+  kintoneBpoApiToken?: string,
 ): Promise<void> {
   const { hour, minute, dateStr, monthStr, day } = jstTimeNow();
   const configs = await getAllAttendanceConfigs(db);
   if (configs.length === 0) return;
 
-  // 朝の Kintone 同期（8:45）— 全アカウント共通で1日1回
-  if (kintoneApiToken && isTimeWindow(hour, minute, '08:45')) {
-    try {
-      await syncKintoneStatuses(db, kintoneApiToken);
-    } catch (err) {
-      console.error('Kintone sync failed:', err);
+  // 朝の Kintone 同期（8:40）— 全アカウント共通で1日1回
+  // - BPO企業マスタ全件洗い替え
+  // - 紐付け済み稼働者の参画情報 (状況/案件/企業/代理店/紹介者/開始日) を同期
+  if (isTimeWindow(hour, minute, '08:40')) {
+    if (kintoneBpoApiToken) {
+      try {
+        await syncKintoneCompanies(db, kintoneBpoApiToken);
+      } catch (err) {
+        console.error('Kintone companies sync failed:', err);
+      }
+    }
+    if (kintoneApiToken) {
+      try {
+        await syncKintoneAssignments(db, kintoneApiToken);
+      } catch (err) {
+        console.error('Kintone assignments sync failed:', err);
+      }
     }
   }
 

@@ -27,6 +27,7 @@ export * from './attendance';
 export * from './friend-attendance';
 export * from './onboarding';
 export * from './holidays';
+export * from './kintone-mirror';
 
 /**
  * Thin wrapper around D1Database.

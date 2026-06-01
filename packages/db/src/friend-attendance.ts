@@ -260,6 +260,40 @@ export async function updateFriendKintoneStatus(
   ).bind(friendId, status).run();
 }
 
+/**
+ * 稼働者の参画情報を friend_shifts に保存
+ */
+export async function upsertFriendAssignment(
+  db: D1Database,
+  friendId: string,
+  data: {
+    current_case_name?: string | null;
+    current_billing_company?: string | null;
+    agency_name?: string | null;
+    referrer?: string | null;
+    assignment_start_date?: string | null;
+  },
+): Promise<void> {
+  await db.prepare(
+    `INSERT INTO friend_shifts (friend_id, current_case_name, current_billing_company, agency_name, referrer, assignment_start_date)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(friend_id) DO UPDATE SET
+       current_case_name = excluded.current_case_name,
+       current_billing_company = excluded.current_billing_company,
+       agency_name = excluded.agency_name,
+       referrer = excluded.referrer,
+       assignment_start_date = excluded.assignment_start_date,
+       updated_at = datetime('now')`
+  ).bind(
+    friendId,
+    data.current_case_name ?? null,
+    data.current_billing_company ?? null,
+    data.agency_name ?? null,
+    data.referrer ?? null,
+    data.assignment_start_date ?? null,
+  ).run();
+}
+
 // ── Friend Clock Records ───────────────────────────
 
 export async function getFriendClockRecord(db: D1Database, friendId: string, targetDate: string): Promise<FriendClockRecordRow | null> {
