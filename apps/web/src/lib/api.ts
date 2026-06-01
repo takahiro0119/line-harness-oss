@@ -650,6 +650,19 @@ export const api = {
 }
 
 // ── Kintone Types ────────────────────────────────────────────────────
+export type KintoneCompanyWorker = {
+  kintoneId: string
+  name: string
+  status: string
+  caseName: string
+  agencyName: string
+  referrer: string
+  startDate: string
+  isLinked: boolean
+  friendId: string | null
+  lineDisplayName: string | null
+}
+
 export type KintoneCompanyItem = {
   kintoneId: string
   companyName: string | null
@@ -664,19 +677,23 @@ export type KintoneCompanyItem = {
   workHours: string | null
   workEnvironment: string | null
   activeWorkerCount: number
-  syncedAt: string
+  activeWorkers: KintoneCompanyWorker[]
 }
 
 export type KintoneAssignmentItem = {
-  friendId: string
-  displayName: string | null
-  kintoneId: string | null
-  status: string | null
-  caseName: string | null
-  billingCompany: string | null
-  agencyName: string | null
-  referrer: string | null
-  assignmentStartDate: string | null
+  kintoneId: string
+  name: string
+  status: string
+  caseName: string
+  billingCompany: string
+  agencyName: string
+  referrer: string
+  salesPerson: string
+  assignmentStartDate: string
+  isLinked: boolean
+  friendId: string | null
+  lineDisplayName: string | null
+  isFollowing: boolean
 }
 
 // ── Group Types ─────────────────────────────────────────────────────────────

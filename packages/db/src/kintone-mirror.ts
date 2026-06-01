@@ -141,6 +141,34 @@ export async function countAssignmentsByCompany(db: D1Database): Promise<Array<{
 }
 
 /**
+ * Kintone レコードID → LINE 紐付け情報 (友だちID + 表示名) のマップ
+ * ダッシュボードで「LINE連携済み」判定に使う
+ */
+export interface KintoneLinkInfo {
+  friend_id: string;
+  display_name: string | null;
+  is_following: number;
+}
+
+export async function getKintoneIdToFriendMap(db: D1Database): Promise<Map<string, KintoneLinkInfo>> {
+  const r = await db.prepare(`
+    SELECT fo.kintone_id, f.id as friend_id, f.display_name, f.is_following
+    FROM friend_onboarding fo
+    JOIN friends f ON f.id = fo.friend_id
+    WHERE fo.kintone_id IS NOT NULL AND fo.kintone_id != ''
+  `).all<{ kintone_id: string; friend_id: string; display_name: string | null; is_following: number }>();
+  const map = new Map<string, KintoneLinkInfo>();
+  for (const row of r.results) {
+    map.set(row.kintone_id, {
+      friend_id: row.friend_id,
+      display_name: row.display_name,
+      is_following: row.is_following,
+    });
+  }
+  return map;
+}
+
+/**
  * 代理店別の参画稼働者数
  */
 export async function countAssignmentsByAgency(db: D1Database): Promise<Array<{ agency: string; count: number }>> {

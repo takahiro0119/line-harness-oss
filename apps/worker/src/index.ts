@@ -54,6 +54,7 @@ export type Env = {
     ANTHROPIC_API_KEY?: string;
     KINTONE_API_TOKEN?: string;
     KINTONE_API_TOKEN_BPO?: string;  // BPO企業マスタ (appId=22)用
+    KINTONE_API_TOKEN_SANRI?: string; // 参画離脱マスタ (appId=165)用
     X_HARNESS_URL?: string;  // Optional: X Harness API URL for account linking
   };
   Variables: {

@@ -7,6 +7,7 @@
 const KINTONE_SUBDOMAIN = '52vgnlmalqud';
 const KINTONE_APP_ID = '57';
 const KINTONE_BPO_APP_ID = '22';
+const KINTONE_SANRI_APP_ID = '165';
 
 function normalizePhone(s: string): string {
   return (s || '').replace(/[^0-9]/g, '');
@@ -305,6 +306,37 @@ async function fetchKintoneCandidatesByNameLike(apiToken: string, name: string):
 }
 
 /**
+ * 稼働者マスタ全件取得（ダッシュボード表示用 - リアルタイム）
+ */
+export async function fetchAllKintoneWorkers(apiToken: string): Promise<KintoneAssignment[]> {
+  const all: KintoneAssignment[] = [];
+  let offset = 0;
+  const limit = 500;
+  for (let i = 0; i < 100; i++) {
+    const query = `limit ${limit} offset ${offset}`;
+    const url = `https://${KINTONE_SUBDOMAIN}.cybozu.com/k/v1/records.json?app=${KINTONE_APP_ID}&query=${encodeURIComponent(query)}&${ASSIGNMENT_FIELDS}`;
+    try {
+      const res = await fetch(url, { headers: { 'X-Cybozu-API-Token': apiToken } });
+      if (!res.ok) {
+        console.error('Worker master fetch error:', res.status, await res.text());
+        break;
+      }
+      const data = await res.json() as KintoneSearchResult;
+      if (data.records.length === 0) break;
+      for (const r of data.records) {
+        all.push(toAssignment(r));
+      }
+      if (data.records.length < limit) break;
+      offset += limit;
+    } catch (err) {
+      console.error('fetchAllKintoneWorkers failed:', err);
+      break;
+    }
+  }
+  return all;
+}
+
+/**
  * 稼働者マスタの「参画情報」をレコードIDから取得（朝同期用）
  */
 export async function fetchKintoneAssignments(
@@ -362,6 +394,152 @@ const COMPANY_FIELDS =
   '&fields[9]=担当者名&fields[10]=担当者メールアドレス&fields[11]=担当者直通電話番号' +
   '&fields[12]=CS担当者&fields[13]=営業担当者&fields[14]=稼働場所&fields[15]=稼働時間' +
   '&fields[16]=稼働環境&fields[17]=稼働総人数';
+
+// ── 参画離脱マスタ (appId=165) ─────────────────────
+
+export interface SanRiRecord {
+  recordId: string;
+  type: '参画' | '離脱' | '';
+  name: string;           // 参画なら 氏名 / 離脱なら 離脱氏名
+  company: string;        // 参画なら 企業名 / 離脱なら 離脱企業名
+  caseName: string;       // 案件名 (参画のみ)
+  startDate: string;      // 稼働開始日 (参画のみ)
+  endDate: string;        // 退場日 (離脱のみ)
+  referrer: string;       // 参画なら 紹介者 / 離脱なら 離脱紹介者
+  salesPerson: string;    // 参画なら 営業担当者 / 離脱なら 離脱営業担当者
+}
+
+const SANRI_FIELDS =
+  'fields[0]=レコード番号&fields[1]=参画_離脱&fields[2]=氏名&fields[3]=企業名&fields[4]=案件名' +
+  '&fields[5]=稼働開始日&fields[6]=紹介者&fields[7]=営業担当者' +
+  '&fields[8]=離脱氏名&fields[9]=離脱企業名&fields[10]=退場日&fields[11]=離脱紹介者&fields[12]=離脱営業担当者';
+
+function toSanRi(r: KintoneRecord): SanRiRecord {
+  const type = ((r['参画_離脱']?.value as string) || '').trim() as '参画' | '離脱' | '';
+  if (type === '離脱') {
+    return {
+      recordId: r['レコード番号'].value as string,
+      type: '離脱',
+      name: ((r['離脱氏名']?.value as string) || '').trim(),
+      company: ((r['離脱企業名']?.value as string) || '').trim(),
+      caseName: '',
+      startDate: '',
+      endDate: (r['退場日']?.value as string) || '',
+      referrer: ((r['離脱紹介者']?.value as string) || '').trim(),
+      salesPerson: ((r['離脱営業担当者']?.value as string) || '').trim(),
+    };
+  }
+  return {
+    recordId: r['レコード番号'].value as string,
+    type: type || '参画',
+    name: ((r['氏名']?.value as string) || '').trim(),
+    company: ((r['企業名']?.value as string) || '').trim(),
+    caseName: ((r['案件名']?.value as string) || '').trim(),
+    startDate: (r['稼働開始日']?.value as string) || '',
+    endDate: '',
+    referrer: ((r['紹介者']?.value as string) || '').trim(),
+    salesPerson: ((r['営業担当者']?.value as string) || '').trim(),
+  };
+}
+
+export async function fetchAllSanRiRecords(apiToken: string): Promise<SanRiRecord[]> {
+  const all: SanRiRecord[] = [];
+  let offset = 0;
+  const limit = 500;
+  for (let i = 0; i < 100; i++) {
+    const query = `limit ${limit} offset ${offset}`;
+    const url = `https://${KINTONE_SUBDOMAIN}.cybozu.com/k/v1/records.json?app=${KINTONE_SANRI_APP_ID}&query=${encodeURIComponent(query)}&${SANRI_FIELDS}`;
+    try {
+      const res = await fetch(url, { headers: { 'X-Cybozu-API-Token': apiToken } });
+      if (!res.ok) {
+        console.error('SanRi fetch error:', res.status, await res.text());
+        break;
+      }
+      const data = await res.json() as KintoneSearchResult;
+      if (data.records.length === 0) break;
+      for (const r of data.records) all.push(toSanRi(r));
+      if (data.records.length < limit) break;
+      offset += limit;
+    } catch (err) {
+      console.error('fetchAllSanRiRecords failed:', err);
+      break;
+    }
+  }
+  return all;
+}
+
+function normalizeName(s: string): string {
+  return (s || '').replace(/[\s　]/g, '');
+}
+
+/**
+ * 参画離脱レコードから「現在の参画情報」を稼働者名ごとに計算
+ * - 同名稼働者の最新の参画レコード（稼働開始日 desc）を候補
+ * - その参画レコードの 稼働開始日 以降に同名 + 同企業 の離脱があれば
+ *   退場日 < 今日 → 離脱済み（current=null）
+ *   退場日 >= 今日 → まだ参画中
+ *   なし → 参画中
+ */
+export interface CurrentAssignment {
+  name: string;
+  company: string;
+  caseName: string;
+  startDate: string;
+  referrer: string;
+  salesPerson: string;
+}
+
+export function computeCurrentAssignmentsByName(records: SanRiRecord[]): Map<string, CurrentAssignment> {
+  const today = new Date(Date.now() + 9 * 60 * 60_000).toISOString().slice(0, 10);
+
+  // 名前ごとの参画レコード（稼働開始日 desc）
+  const joinByName = new Map<string, SanRiRecord[]>();
+  // 名前ごとの離脱レコード（退場日 desc）
+  const leaveByName = new Map<string, SanRiRecord[]>();
+
+  for (const r of records) {
+    const name = normalizeName(r.name);
+    if (!name) continue;
+    if (r.type === '参画' && r.startDate) {
+      if (!joinByName.has(name)) joinByName.set(name, []);
+      joinByName.get(name)!.push(r);
+    } else if (r.type === '離脱' && r.endDate) {
+      if (!leaveByName.has(name)) leaveByName.set(name, []);
+      leaveByName.get(name)!.push(r);
+    }
+  }
+
+  const result = new Map<string, CurrentAssignment>();
+
+  for (const [name, joins] of joinByName) {
+    // 最新の参画
+    joins.sort((a, b) => b.startDate.localeCompare(a.startDate));
+    const latest = joins[0];
+
+    // 同企業の離脱がないか確認
+    const leaves = leaveByName.get(name) || [];
+    const leaveForCompany = leaves
+      .filter(l => normalizeName(l.company) === normalizeName(latest.company))
+      .filter(l => l.endDate >= latest.startDate)
+      .sort((a, b) => b.endDate.localeCompare(a.endDate))[0];
+
+    if (leaveForCompany && leaveForCompany.endDate < today) {
+      // 既に退場済み
+      continue;
+    }
+
+    result.set(name, {
+      name: latest.name,
+      company: latest.company,
+      caseName: latest.caseName,
+      startDate: latest.startDate,
+      referrer: latest.referrer,
+      salesPerson: latest.salesPerson,
+    });
+  }
+
+  return result;
+}
 
 /**
  * BPO企業マスタ 全件取得（500件超は cursor で分割）
