@@ -621,10 +621,21 @@ export const api = {
     },
     createRecord: (data: { friendId: string; lineUserId: string; displayName?: string; targetDate: string; clockIn?: string; clockOut?: string }) =>
       fetchApi<ApiResponse<unknown>>('/api/attendance/records', { method: 'POST', body: JSON.stringify(data) }),
+    updateRecord: (friendId: string, targetDate: string, data: { clockIn?: string | null; clockOut?: string | null }) =>
+      fetchApi<ApiResponse<unknown>>(`/api/attendance/records/${friendId}/${targetDate}`, { method: 'PUT', body: JSON.stringify(data) }),
+    deleteRecord: (friendId: string, targetDate: string) =>
+      fetchApi<ApiResponse<unknown>>(`/api/attendance/records/${friendId}/${targetDate}`, { method: 'DELETE' }),
     monthly: (month: string) =>
       fetchApi<ApiResponse<FriendMonthlyConfItem[]>>(`/api/attendance/monthly?month=${month}`),
     setupRichMenu: () =>
       fetchApi<ApiResponse<{ richMenuId: string; message: string }>>('/api/attendance/richmenu/setup', { method: 'POST' }),
+    absences: (params: { friendId: string; startDate: string; endDate: string }) =>
+      fetchApi<ApiResponse<{ id: string; friendId: string; targetDate: string; reason: string | null; source: string; createdAt: string }[]>>(`/api/attendance/absences?friendId=${params.friendId}&startDate=${params.startDate}&endDate=${params.endDate}`),
+    addAbsence: (data: { friendId: string; targetDate: string; reason?: string | null }) =>
+      fetchApi<ApiResponse<unknown>>('/api/attendance/absences', { method: 'POST', body: JSON.stringify(data) }),
+    deleteAbsence: (friendId: string, targetDate: string) =>
+      fetchApi<ApiResponse<unknown>>(`/api/attendance/absences/${friendId}/${targetDate}`, { method: 'DELETE' }),
+    exportUrl: (month: string) => `${API_URL}/api/attendance/export?month=${month}`,
   },
 }
 
@@ -764,6 +775,7 @@ export type FriendAttendanceConfig = {
   clockOutTime: string
   clockOutReminderTime: string
   monthlyConfirmDay: number
+  csNotificationGroupId: string | null
 }
 
 export type FriendAttendanceConfigInput = {
@@ -774,6 +786,7 @@ export type FriendAttendanceConfigInput = {
   clockOutTime?: string
   clockOutReminderTime?: string
   monthlyConfirmDay?: number
+  csNotificationGroupId?: string | null
 }
 
 export type FriendShiftItem = {

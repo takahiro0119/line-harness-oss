@@ -37,6 +37,7 @@ import { adPlatforms } from './routes/ad-platforms.js';
 import { staff } from './routes/staff.js';
 import { groups } from './routes/groups.js';
 import { friendAttendance } from './routes/friend-attendance.js';
+import { entryRoutes } from './routes/entry-routes.js';
 
 export type Env = {
   Bindings: {
@@ -97,6 +98,7 @@ app.route('/', adPlatforms);
 app.route('/', staff);
 app.route('/', groups);
 app.route('/', friendAttendance);
+app.route('/', entryRoutes);
 
 // Short link: /r/:ref → landing page with LINE open button
 app.get('/r/:ref', (c) => {
@@ -170,7 +172,7 @@ async function scheduled(
   // 1:1勤怠打刻の定期処理
   for (const token of activeTokens) {
     const lineClient = new LineClient(token);
-    jobs.push(processFriendAttendanceClock(env.DB, lineClient));
+    jobs.push(processFriendAttendanceClock(env.DB, lineClient, env.KINTONE_API_TOKEN));
   }
 
   await Promise.allSettled(jobs);

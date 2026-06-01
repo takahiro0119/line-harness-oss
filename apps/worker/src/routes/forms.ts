@@ -8,6 +8,9 @@ import {
   getFormSubmissions,
   createFormSubmission,
   jstNow,
+  getFriendOnboarding,
+  updateOnboardingStep,
+  upsertFriendShift,
 } from '@line-crm/db';
 import { getFriendByLineUserId, getFriendById } from '@line-crm/db';
 import { addTagToFriend, enrollFriendInScenario } from '@line-crm/db';
@@ -250,6 +253,29 @@ forms.post('/api/forms/:id/submit', async (c) => {
       // Add tag
       if (form.on_submit_tag_id) {
         sideEffects.push(addTagToFriend(db, friendId, form.on_submit_tag_id));
+      }
+
+      // スキルシート専用フック: 新規稼働者オンボーディング完了 + 稼働対象登録
+      if (form.id === 'skill_sheet') {
+        sideEffects.push(
+          (async () => {
+            try {
+              const onboarding = await getFriendOnboarding(db, friendId!);
+              if (onboarding && !onboarding.completed && onboarding.flow_type === 'bpo_new_worker') {
+                const fullName = (submissionData['name'] as string | undefined) ?? null;
+                await updateOnboardingStep(db, friendId!, 'complete', { fullName });
+              }
+              await upsertFriendShift(db, friendId!, {
+                pattern_type: 'default',
+                work_days: '1,2,3,4,5',
+                exclude_holidays: 1,
+                is_excluded: 0,
+              });
+            } catch (err) {
+              console.error('skill_sheet hook failed:', err);
+            }
+          })(),
+        );
       }
 
       // Enroll in scenario

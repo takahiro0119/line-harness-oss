@@ -13,6 +13,8 @@ export interface AttendanceConfigRow {
   clock_out_time: string;
   clock_out_reminder_time: string;
   monthly_confirm_day: number;
+  cs_notification_group_id: string | null;
+  form_bridge_url: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -28,6 +30,8 @@ export interface FriendShiftRow {
   clock_out_time: string | null;
   clock_out_reminder_time: string | null;
   is_excluded: number;
+  kintone_status: string | null;
+  kintone_status_synced_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -104,6 +108,7 @@ export async function upsertAttendanceConfig(
     if (data.clock_out_time !== undefined) { fields.push('clock_out_time = ?'); values.push(data.clock_out_time); }
     if (data.clock_out_reminder_time !== undefined) { fields.push('clock_out_reminder_time = ?'); values.push(data.clock_out_reminder_time); }
     if (data.monthly_confirm_day !== undefined) { fields.push('monthly_confirm_day = ?'); values.push(data.monthly_confirm_day); }
+    if (data.cs_notification_group_id !== undefined) { fields.push('cs_notification_group_id = ?'); values.push(data.cs_notification_group_id); }
     if (fields.length > 0) {
       fields.push("updated_at = datetime('now')");
       if (lineAccountId) {
@@ -120,7 +125,7 @@ export async function upsertAttendanceConfig(
     ).bind(
       lineAccountId,
       data.is_enabled ?? 1,
-      data.clock_in_time ?? '09:00',
+      data.clock_in_time ?? '08:50',
       data.clock_in_reminder_time ?? '12:00',
       data.clock_out_time ?? '18:00',
       data.clock_out_reminder_time ?? '21:00',
@@ -182,6 +187,8 @@ export interface AttendanceTarget {
   line_user_id: string;
   display_name: string | null;
   line_account_id: string | null;
+  kintone_id: string | null;
+  kintone_status: string | null;
   // shift (null = use default config)
   clock_in_time: string | null;
   clock_in_reminder_time: string | null;
@@ -191,16 +198,25 @@ export interface AttendanceTarget {
   exclude_holidays: number;
 }
 
+/**
+ * 稼働対象の友だち一覧（Kintone「参画中」のみ）
+ * - friend_onboarding に kintone_id がある人だけが対象
+ * - friend_shifts.kintone_status = '参画中' のみ送信対象
+ */
 export async function getAttendanceTargets(db: D1Database, lineAccountId?: string | null): Promise<AttendanceTarget[]> {
   let sql = `
     SELECT f.id as friend_id, f.line_user_id, f.display_name, f.line_account_id,
+           fo.kintone_id,
+           fs.kintone_status,
            fs.clock_in_time, fs.clock_in_reminder_time, fs.clock_out_time, fs.clock_out_reminder_time,
            COALESCE(fs.work_days, '1,2,3,4,5') as work_days,
            COALESCE(fs.exclude_holidays, 1) as exclude_holidays
     FROM friends f
     LEFT JOIN friend_shifts fs ON fs.friend_id = f.id
+    LEFT JOIN friend_onboarding fo ON fo.friend_id = f.id
     WHERE f.is_following = 1
-      AND (fs.is_excluded IS NULL OR fs.is_excluded = 0)`;
+      AND (fs.is_excluded IS NULL OR fs.is_excluded = 0)
+      AND fs.kintone_status = '参画中'`;
   const binds: unknown[] = [];
   if (lineAccountId) {
     sql += ` AND (f.line_account_id = ? OR f.line_account_id IS NULL)`;
@@ -208,6 +224,40 @@ export async function getAttendanceTargets(db: D1Database, lineAccountId?: strin
   }
   const r = await db.prepare(sql).bind(...binds).all<AttendanceTarget>();
   return r.results;
+}
+
+/**
+ * Kintone と紐付け済みの全友だち（状況フィルタなし）— 朝の状況同期で使う
+ */
+export async function getKintoneLinkedFriends(db: D1Database): Promise<Array<{
+  friend_id: string;
+  line_account_id: string | null;
+  kintone_id: string;
+}>> {
+  const r = await db.prepare(`
+    SELECT f.id as friend_id, f.line_account_id, fo.kintone_id
+    FROM friends f
+    JOIN friend_onboarding fo ON fo.friend_id = f.id
+    WHERE f.is_following = 1 AND fo.kintone_id IS NOT NULL AND fo.kintone_id != ''
+  `).all<{ friend_id: string; line_account_id: string | null; kintone_id: string }>();
+  return r.results;
+}
+
+/**
+ * Kintone「状況」フィールドを friend_shifts に保存
+ * shift 行がなければデフォルト値で作成する
+ */
+export async function updateFriendKintoneStatus(
+  db: D1Database, friendId: string, status: string,
+): Promise<void> {
+  await db.prepare(
+    `INSERT INTO friend_shifts (friend_id, kintone_status, kintone_status_synced_at)
+     VALUES (?, ?, datetime('now'))
+     ON CONFLICT(friend_id) DO UPDATE SET
+       kintone_status = excluded.kintone_status,
+       kintone_status_synced_at = datetime('now'),
+       updated_at = datetime('now')`
+  ).bind(friendId, status).run();
 }
 
 // ── Friend Clock Records ───────────────────────────
@@ -357,18 +407,23 @@ export async function getUnclockedFriends(
   let sql = `
     SELECT f.id as friend_id, f.line_user_id, f.display_name
     FROM friends f
-    LEFT JOIN friend_shifts fs ON fs.friend_id = f.id
+    JOIN friend_shifts fs ON fs.friend_id = f.id
     WHERE f.is_following = 1
-      AND (fs.is_excluded IS NULL OR fs.is_excluded = 0)
+      AND fs.is_excluded = 0
+      AND fs.kintone_status = '参画中'
       AND f.id NOT IN (
         SELECT friend_id FROM friend_clock_records
         WHERE target_date = ? AND ${column} IS NOT NULL
+      )
+      AND f.id NOT IN (
+        SELECT friend_id FROM friend_absences WHERE target_date = ?
       )`;
-  const binds: unknown[] = [targetDate];
+  const binds: unknown[] = [targetDate, targetDate];
   if (lineAccountId) {
     sql += ` AND (f.line_account_id = ? OR f.line_account_id IS NULL)`;
     binds.push(lineAccountId);
   }
+  sql += ' ORDER BY f.display_name ASC';
   const r = await db.prepare(sql).bind(...binds).all<{ friend_id: string; line_user_id: string; display_name: string | null }>();
   return r.results;
 }
@@ -386,4 +441,119 @@ export async function calcFriendMonthlySummary(
     }
   }
   return { totalDays, totalHours: Math.round(totalHours * 100) / 100 };
+}
+
+// ── Clock Record Edit ──────────────────────────────
+
+export async function deleteFriendClockRecord(db: D1Database, friendId: string, targetDate: string): Promise<void> {
+  await db.prepare('DELETE FROM friend_clock_records WHERE friend_id = ? AND target_date = ?')
+    .bind(friendId, targetDate).run();
+}
+
+export async function updateFriendClockRecord(
+  db: D1Database, friendId: string, targetDate: string,
+  data: { clockIn?: string | null; clockOut?: string | null }
+): Promise<void> {
+  // 既存recordがあるか確認
+  const existing = await getFriendClockRecord(db, friendId, targetDate);
+  let workHours: number | null = null;
+  const clockIn = data.clockIn !== undefined ? data.clockIn : existing?.clock_in ?? null;
+  const clockOut = data.clockOut !== undefined ? data.clockOut : existing?.clock_out ?? null;
+  if (clockIn && clockOut) {
+    const [inH, inM] = clockIn.split(':').map(Number);
+    const [outH, outM] = clockOut.split(':').map(Number);
+    workHours = Math.round(((outH * 60 + outM) - (inH * 60 + inM)) / 60 * 100) / 100;
+  }
+
+  if (existing) {
+    await db.prepare(
+      `UPDATE friend_clock_records SET clock_in = ?, clock_out = ?, work_hours = ?,
+       clock_in_source = COALESCE(clock_in_source, 'manual'),
+       clock_out_source = CASE WHEN ? IS NOT NULL AND clock_out_source IS NULL THEN 'manual' ELSE clock_out_source END,
+       updated_at = datetime('now')
+       WHERE friend_id = ? AND target_date = ?`
+    ).bind(clockIn, clockOut, workHours, clockOut, friendId, targetDate).run();
+  } else {
+    // 新規追加: friend情報取得
+    const f = await db.prepare('SELECT line_user_id, display_name FROM friends WHERE id = ?').bind(friendId).first<{ line_user_id: string; display_name: string | null }>();
+    if (!f) return;
+    await db.prepare(
+      `INSERT INTO friend_clock_records (friend_id, line_user_id, display_name, target_date, clock_in, clock_out, work_hours, clock_in_source, clock_out_source)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(friendId, f.line_user_id, f.display_name, targetDate, clockIn, clockOut, workHours, clockIn ? 'manual' : null, clockOut ? 'manual' : null).run();
+  }
+}
+
+// ── Friend Absences ────────────────────────────────
+
+export interface FriendAbsenceRow {
+  id: string;
+  friend_id: string;
+  target_date: string;
+  reason: string | null;
+  source: 'text' | 'manual' | 'richmenu';
+  created_at: string;
+}
+
+export async function getFriendAbsence(db: D1Database, friendId: string, targetDate: string): Promise<FriendAbsenceRow | null> {
+  return db.prepare('SELECT * FROM friend_absences WHERE friend_id = ? AND target_date = ?')
+    .bind(friendId, targetDate).first<FriendAbsenceRow>();
+}
+
+export async function getFriendAbsencesInRange(db: D1Database, friendId: string, startDate: string, endDate: string): Promise<FriendAbsenceRow[]> {
+  const r = await db.prepare(
+    'SELECT * FROM friend_absences WHERE friend_id = ? AND target_date >= ? AND target_date <= ? ORDER BY target_date ASC'
+  ).bind(friendId, startDate, endDate).all<FriendAbsenceRow>();
+  return r.results;
+}
+
+export async function upsertFriendAbsence(
+  db: D1Database, friendId: string, targetDate: string,
+  data: { reason?: string | null; source?: 'text' | 'manual' | 'richmenu' }
+): Promise<void> {
+  await db.prepare(
+    `INSERT INTO friend_absences (friend_id, target_date, reason, source) VALUES (?, ?, ?, ?)
+     ON CONFLICT(friend_id, target_date) DO UPDATE SET reason = excluded.reason, source = excluded.source`
+  ).bind(friendId, targetDate, data.reason ?? null, data.source ?? 'text').run();
+}
+
+export async function deleteFriendAbsence(db: D1Database, friendId: string, targetDate: string): Promise<void> {
+  await db.prepare('DELETE FROM friend_absences WHERE friend_id = ? AND target_date = ?')
+    .bind(friendId, targetDate).run();
+}
+
+// ── Long Absence Alerts ───────────────────────────
+
+export async function getLastAbsenceAlert(db: D1Database, friendId: string, alertType: 'long_absence'): Promise<{ alerted_at: string } | null> {
+  return db.prepare(
+    'SELECT alerted_at FROM friend_absence_alerts WHERE friend_id = ? AND alert_type = ? ORDER BY alerted_at DESC LIMIT 1'
+  ).bind(friendId, alertType).first<{ alerted_at: string }>();
+}
+
+export async function insertAbsenceAlert(db: D1Database, friendId: string, alertType: 'long_absence', context: string): Promise<void> {
+  await db.prepare(
+    'INSERT INTO friend_absence_alerts (friend_id, alert_type, context) VALUES (?, ?, ?)'
+  ).bind(friendId, alertType, context).run();
+}
+
+// ── Pending Revision Inputs ───────────────────────
+
+export async function createPendingRevision(db: D1Database, friendId: string, targetMonth: string): Promise<void> {
+  // 既存の未解決を解決済みにしてから新規作成
+  await db.prepare('UPDATE pending_revision_inputs SET resolved = 1 WHERE friend_id = ? AND resolved = 0')
+    .bind(friendId).run();
+  await db.prepare(
+    'INSERT INTO pending_revision_inputs (friend_id, target_month) VALUES (?, ?)'
+  ).bind(friendId, targetMonth).run();
+}
+
+export async function getPendingRevision(db: D1Database, friendId: string): Promise<{ id: string; target_month: string; created_at: string } | null> {
+  return db.prepare(
+    `SELECT id, target_month, created_at FROM pending_revision_inputs
+     WHERE friend_id = ? AND resolved = 0 ORDER BY created_at DESC LIMIT 1`
+  ).bind(friendId).first<{ id: string; target_month: string; created_at: string }>();
+}
+
+export async function resolvePendingRevision(db: D1Database, id: string): Promise<void> {
+  await db.prepare('UPDATE pending_revision_inputs SET resolved = 1 WHERE id = ?').bind(id).run();
 }

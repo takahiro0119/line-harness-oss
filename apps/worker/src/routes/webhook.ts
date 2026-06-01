@@ -47,11 +47,17 @@ import {
   confirmFriendMonthly,
   requestFriendMonthlyRevision,
   getFriendShift,
+  upsertFriendAbsence,
+  createPendingRevision,
+  getPendingRevision,
+  resolvePendingRevision,
 } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
 import { handleGroupAIMessage } from '../services/group-ai.js';
 import { startOnboardingIfNeeded, handleOnboardingMessage } from '../services/onboarding.js';
+import { isAttendanceHistoryQuery, handleAttendanceHistoryQuery } from '../services/attendance-history.js';
+import { detectAbsenceText } from '../services/absence-detector.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
@@ -150,6 +156,27 @@ async function handleEvent(
         .bind(lineAccountId, friend.id).run();
     }
 
+    // pending_friend_refs から ref_code 反映（LIFF link が follow より先に走った場合の救済）
+    try {
+      const pendingRef = await db.prepare('SELECT ref_code FROM pending_friend_refs WHERE line_user_id = ?')
+        .bind(userId).first<{ ref_code: string }>();
+      if (pendingRef?.ref_code && !friend.ref_code) {
+        await db.prepare('UPDATE friends SET ref_code = ? WHERE id = ? AND ref_code IS NULL')
+          .bind(pendingRef.ref_code, friend.id).run();
+        friend.ref_code = pendingRef.ref_code;
+        await db.prepare('DELETE FROM pending_friend_refs WHERE line_user_id = ?').bind(userId).run();
+      }
+    } catch (err) {
+      console.error('Failed to apply pending_friend_ref:', err);
+    }
+
+    // オペレーターチャットに自動登録（友だち登録時点でリストに出るように）
+    try {
+      await upsertChatOnMessage(db, friend.id);
+    } catch (err) {
+      console.error('Failed to upsert chat on follow:', err);
+    }
+
     // friend_add シナリオに登録（このアカウントのシナリオのみ）
     const scenarios = await getScenarios(db);
     for (const scenario of scenarios) {
@@ -215,7 +242,8 @@ async function handleEvent(
     //    シナリオで使われなかった場合のみオンボーディングで使用
     if (friend.ref_code) {
       try {
-        await startOnboardingIfNeeded(db, lineClient, friend.id, friend.ref_code, event.replyToken);
+        const liffId = c.env.LIFF_URL?.match(/liff\.line\.me\/([\w-]+)/)?.[1];
+        await startOnboardingIfNeeded(db, lineClient, friend.id, friend.ref_code, event.replyToken, liffId);
       } catch (err) {
         console.error('Onboarding start error:', err);
       }
@@ -266,20 +294,96 @@ async function handleEvent(
           if (pendingReminder.reminder_type === 'clock_in') {
             await upsertFriendClockIn(db, friend.id, userId, friend.display_name, pendingReminder.target_date, parsedTime, 'reminder');
             await lineClient.replyMessage(event.replyToken, [{
-              type: 'text', text: `出勤を${parsedTime}で記録しました`,
+              type: 'text', text: `稼働開始を${parsedTime}で記録しました`,
             }]);
           } else {
             await upsertFriendClockOut(db, friend.id, userId, friend.display_name, pendingReminder.target_date, parsedTime, 'reminder');
             const record = await getFriendClockRecord(db, friend.id, pendingReminder.target_date);
             const hoursText = record?.work_hours ? `（稼働: ${record.work_hours}時間）` : '';
             await lineClient.replyMessage(event.replyToken, [{
-              type: 'text', text: `退勤を${parsedTime}で記録しました${hoursText}`,
+              type: 'text', text: `稼働終了を${parsedTime}で記録しました${hoursText}`,
             }]);
           }
           await resolveFriendClockReminder(db, pendingReminder.id);
           return;
         }
       }
+    }
+
+    // ─── 修正依頼の理由テキスト待ち受け ────────────────────────────
+    try {
+      const pendingRev = await getPendingRevision(db, friend.id);
+      if (pendingRev) {
+        await requestFriendMonthlyRevision(db, friend.id, pendingRev.target_month, incomingText);
+        await resolvePendingRevision(db, pendingRev.id);
+
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `修正内容を承りました。担当者よりご連絡いたします。`,
+        }]);
+
+        // CS通知（理由付き）
+        try {
+          const cfg = await getAttendanceConfig(db, lineAccountId);
+          if (cfg?.cs_notification_group_id) {
+            const summary = await calcFriendMonthlySummary(db, friend.id, pendingRev.target_month);
+            await lineClient.pushMessage(cfg.cs_notification_group_id, [{
+              type: 'flex',
+              altText: `${friend.display_name || '稼働者'}さんから修正依頼の詳細`,
+              contents: {
+                type: 'bubble',
+                body: {
+                  type: 'box', layout: 'vertical', paddingAll: '20px',
+                  contents: [
+                    { type: 'text', text: '📝 修正依頼の詳細', size: 'lg', weight: 'bold', color: '#dc2626' },
+                    { type: 'separator', margin: 'lg' },
+                    { type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm', contents: [
+                      { type: 'box', layout: 'horizontal', contents: [
+                        { type: 'text', text: '稼働者', size: 'sm', color: '#64748b', flex: 2 },
+                        { type: 'text', text: friend.display_name || '(不明)', size: 'sm', weight: 'bold', color: '#1e293b', flex: 3, wrap: true },
+                      ]},
+                      { type: 'box', layout: 'horizontal', contents: [
+                        { type: 'text', text: '対象月', size: 'sm', color: '#64748b', flex: 2 },
+                        { type: 'text', text: pendingRev.target_month, size: 'sm', color: '#1e293b', flex: 3 },
+                      ]},
+                      { type: 'box', layout: 'horizontal', contents: [
+                        { type: 'text', text: '集計内容', size: 'sm', color: '#64748b', flex: 2 },
+                        { type: 'text', text: `${summary.totalDays}日 / ${summary.totalHours}h`, size: 'sm', color: '#1e293b', flex: 3 },
+                      ]},
+                    ]},
+                    { type: 'text', text: '修正内容', size: 'sm', weight: 'bold', color: '#475569', margin: 'lg' },
+                    { type: 'box', layout: 'vertical', margin: 'sm', paddingAll: '12px', backgroundColor: '#fef3c7', cornerRadius: 'md',
+                      contents: [
+                        { type: 'text', text: incomingText, size: 'sm', color: '#1e293b', wrap: true },
+                      ],
+                    },
+                  ],
+                },
+              },
+            }]);
+          }
+        } catch (err) {
+          console.error('CS revision-detail notification failed:', err);
+        }
+        return;
+      }
+    } catch (err) {
+      console.error('Pending revision check error:', err);
+    }
+
+    // ─── 休み報告検知 ──────────────────────────────────────────────
+    try {
+      const absence = detectAbsenceText(incomingText);
+      if (absence) {
+        await upsertFriendAbsence(db, friend.id, absence.date, { reason: incomingText, source: 'text' });
+        await lineClient.replyMessage(event.replyToken, [{
+          type: 'text',
+          text: `${absence.dateLabel}の休みを承りました。お大事になさってください。\nまたいつでもご連絡ください。`,
+        }]);
+        return;
+      }
+    } catch (err) {
+      console.error('Absence detection error:', err);
     }
 
     // ─── オンボーディング会話チェック ───────────────────────────────
@@ -290,9 +394,19 @@ async function handleEvent(
       console.error('Onboarding message error:', err);
     }
 
+    // ─── 打刻履歴クエリ（「打刻履歴教えて」等）──────────────────────
+    if (isAttendanceHistoryQuery(incomingText)) {
+      try {
+        await handleAttendanceHistoryQuery(db, lineClient, friend.id, incomingText, event.replyToken);
+        return;
+      } catch (err) {
+        console.error('Attendance history query error:', err);
+      }
+    }
+
     // チャットを作成/更新（ユーザーの自発的メッセージのみ unread にする）
     // ボタンタップ等の自動応答キーワードは除外
-    const autoKeywords = ['料金', '機能', 'API', 'フォーム', 'ヘルプ', 'UUID', 'UUID連携について教えて', 'UUID連携を確認', '配信時間', '導入支援を希望します', 'アカウント連携を見る', '体験を完了する', 'BAN対策を見る', '連携確認', '出勤します', '退勤します'];
+    const autoKeywords = ['料金', '機能', 'API', 'フォーム', 'ヘルプ', 'UUID', 'UUID連携について教えて', 'UUID連携を確認', '配信時間', '導入支援を希望します', 'アカウント連携を見る', '体験を完了する', 'BAN対策を見る', '連携確認', '稼働を開始します', '稼働を終了します'];
     const isAutoKeyword = autoKeywords.some(k => incomingText === k);
     const isTimeCommand = /(?:配信時間|配信|届けて|通知)[はを]?\s*\d{1,2}\s*時/.test(incomingText);
     if (!isAutoKeyword && !isTimeCommand) {
@@ -623,7 +737,7 @@ async function handleEvent(
         await upsertFriendClockIn(db, friend.id, userId, friend.display_name, date, currentTime, 'button');
         await lineClient.replyMessage(event.replyToken, [{
           type: 'text',
-          text: `出勤を記録しました（${currentTime}）`,
+          text: `稼働開始を記録しました（${currentTime}）`,
         }]);
         return;
       }
@@ -635,7 +749,7 @@ async function handleEvent(
         const hoursText = record?.work_hours ? `（稼働: ${record.work_hours}時間）` : '';
         await lineClient.replyMessage(event.replyToken, [{
           type: 'text',
-          text: `退勤を記録しました（${currentTime}）${hoursText}`,
+          text: `稼働終了を記録しました（${currentTime}）${hoursText}`,
         }]);
         return;
       }
@@ -657,20 +771,64 @@ async function handleEvent(
         const month = data.get('month');
         if (!month) return;
         await requestFriendMonthlyRevision(db, friend.id, month);
+        // 修正内容のテキスト待ち受け
+        await createPendingRevision(db, friend.id, month);
         await lineClient.replyMessage(event.replyToken, [{
           type: 'text',
-          text: `修正依頼を受け付けました。担当者より連絡いたします。`,
+          text: `修正依頼を承りました。\n\n具体的な修正内容を教えてください。\n（例: 「4/15の終了時刻が間違っています。正しくは19:00です」）\n\nそのまま返信していただければ担当者に共有されます。`,
         }]);
+
+        // CS通知グループへpush送信
+        try {
+          const config = await getAttendanceConfig(db, lineAccountId);
+          if (config?.cs_notification_group_id) {
+            const summary = await calcFriendMonthlySummary(db, friend.id, month);
+            await lineClient.pushMessage(config.cs_notification_group_id, [{
+              type: 'flex',
+              altText: `${friend.display_name || '稼働者'}さんから修正依頼`,
+              contents: {
+                type: 'bubble',
+                body: {
+                  type: 'box', layout: 'vertical', paddingAll: '20px',
+                  contents: [
+                    { type: 'text', text: '⚠️ 稼働時間の修正依頼', size: 'lg', weight: 'bold', color: '#dc2626' },
+                    { type: 'separator', margin: 'lg' },
+                    {
+                      type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm',
+                      contents: [
+                        { type: 'box', layout: 'horizontal', contents: [
+                          { type: 'text', text: '稼働者', size: 'sm', color: '#64748b', flex: 2 },
+                          { type: 'text', text: friend.display_name || '(不明)', size: 'sm', weight: 'bold', color: '#1e293b', flex: 3, wrap: true },
+                        ]},
+                        { type: 'box', layout: 'horizontal', contents: [
+                          { type: 'text', text: '対象月', size: 'sm', color: '#64748b', flex: 2 },
+                          { type: 'text', text: month, size: 'sm', color: '#1e293b', flex: 3 },
+                        ]},
+                        { type: 'box', layout: 'horizontal', contents: [
+                          { type: 'text', text: '集計内容', size: 'sm', color: '#64748b', flex: 2 },
+                          { type: 'text', text: `${summary.totalDays}日 / ${summary.totalHours}h`, size: 'sm', color: '#1e293b', flex: 3 },
+                        ]},
+                      ],
+                    },
+                    { type: 'text', text: '内容を確認して稼働者にご連絡ください。', size: 'xs', color: '#64748b', wrap: true, margin: 'lg' },
+                  ],
+                },
+              },
+            }]);
+          }
+        } catch (err) {
+          console.error('CS notification failed:', err);
+        }
         return;
       }
 
-      // リッチメニューからの打刻
+      // リッチメニューからの記録
       if (action === 'richmenu_clock_in') {
         const date = now.toISOString().slice(0, 10);
         await upsertFriendClockIn(db, friend.id, userId, friend.display_name, date, currentTime, 'richmenu');
         await lineClient.replyMessage(event.replyToken, [{
           type: 'text',
-          text: `出勤を記録しました（${currentTime}）`,
+          text: `稼働開始を記録しました（${currentTime}）`,
         }]);
         return;
       }
@@ -682,7 +840,7 @@ async function handleEvent(
         const hoursText = record?.work_hours ? `（稼働: ${record.work_hours}時間）` : '';
         await lineClient.replyMessage(event.replyToken, [{
           type: 'text',
-          text: `退勤を記録しました（${currentTime}）${hoursText}`,
+          text: `稼働終了を記録しました（${currentTime}）${hoursText}`,
         }]);
         return;
       }
@@ -731,15 +889,15 @@ async function handleEvent(
                     ]},
                   ],
                 },
-                // 打刻一覧ヘッダー
+                // 記録一覧ヘッダー
                 ...(recordLines.length > 0 ? [
-                  { type: 'text', text: '直近の打刻', size: 'sm', weight: 'bold', color: '#475569', margin: 'lg' },
+                  { type: 'text', text: '直近の記録', size: 'sm', weight: 'bold', color: '#475569', margin: 'lg' },
                   {
                     type: 'box', layout: 'horizontal', margin: 'sm', paddingBottom: '4px',
                     contents: [
                       { type: 'text', text: '日付', size: 'xxs', color: '#94a3b8', flex: 2 },
-                      { type: 'text', text: '出勤', size: 'xxs', color: '#94a3b8', flex: 2, align: 'center' },
-                      { type: 'text', text: '退勤', size: 'xxs', color: '#94a3b8', flex: 2, align: 'center' },
+                      { type: 'text', text: '開始', size: 'xxs', color: '#94a3b8', flex: 2, align: 'center' },
+                      { type: 'text', text: '終了', size: 'xxs', color: '#94a3b8', flex: 2, align: 'center' },
                       { type: 'text', text: '時間', size: 'xxs', color: '#94a3b8', flex: 1, align: 'end' },
                     ],
                   },

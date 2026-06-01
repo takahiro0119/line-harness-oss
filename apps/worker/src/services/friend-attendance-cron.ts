@@ -1,6 +1,6 @@
 /**
- * 勤怠打刻 Cron v2: 1:1チャットベース
- * 友だち一人ずつにpushMessageで出勤/退勤ボタンを送信
+ * 稼働記録 Cron v2: 1:1チャットベース
+ * 友だち一人ずつにpushMessageで稼働開始/終了ボタンを送信
  */
 
 import { LineClient } from '@line-crm/line-sdk';
@@ -9,13 +9,20 @@ import {
   getAllAttendanceConfigs,
   getAttendanceTargets,
   getFriendClockRecord,
+  getFriendClockRecords,
   getUnclockedFriends,
   insertFriendClockReminder,
   calcFriendMonthlySummary,
   upsertFriendMonthlyConfirmation,
   isWorkDay,
+  getFriendAbsence,
+  getLastAbsenceAlert,
+  insertAbsenceAlert,
+  getKintoneLinkedFriends,
+  updateFriendKintoneStatus,
 } from '@line-crm/db';
-import type { AttendanceConfigRow, AttendanceTarget } from '@line-crm/db';
+import type { AttendanceConfigRow, AttendanceTarget, FriendClockRecordRow } from '@line-crm/db';
+import { fetchKintoneWorkerStatuses } from './kintone.js';
 
 function jstTimeNow() {
   const now = new Date(Date.now() + 9 * 60 * 60_000);
@@ -44,7 +51,7 @@ function getEffectiveTime(target: AttendanceTarget, config: AttendanceConfigRow,
 function buildClockInMessage(dateStr: string): Message {
   return {
     type: 'flex',
-    altText: '出勤打刻',
+    altText: '稼働開始記録',
     contents: {
       type: 'bubble',
       body: {
@@ -52,7 +59,7 @@ function buildClockInMessage(dateStr: string): Message {
         contents: [
           { type: 'text', text: '☀️ おはようございます', size: 'lg', weight: 'bold', color: '#1e293b' },
           { type: 'text', text: dateStr, size: 'sm', color: '#64748b', margin: 'sm' },
-          { type: 'text', text: '出勤される方は下のボタンを押してください', size: 'sm', color: '#475569', wrap: true, margin: 'lg' },
+          { type: 'text', text: '本日の稼働を開始される方は下のボタンを押してください', size: 'sm', color: '#475569', wrap: true, margin: 'lg' },
         ],
       },
       footer: {
@@ -60,7 +67,7 @@ function buildClockInMessage(dateStr: string): Message {
         contents: [
           {
             type: 'button',
-            action: { type: 'postback', label: '出勤', data: `action=clock_in&date=${dateStr}`, displayText: '出勤します' },
+            action: { type: 'postback', label: '稼働開始', data: `action=clock_in&date=${dateStr}`, displayText: '稼働を開始します' },
             style: 'primary', color: '#06C755', height: 'md',
           },
         ],
@@ -72,7 +79,7 @@ function buildClockInMessage(dateStr: string): Message {
 function buildClockOutMessage(dateStr: string): Message {
   return {
     type: 'flex',
-    altText: '退勤打刻',
+    altText: '稼働終了記録',
     contents: {
       type: 'bubble',
       body: {
@@ -80,7 +87,7 @@ function buildClockOutMessage(dateStr: string): Message {
         contents: [
           { type: 'text', text: '🌙 お疲れ様でした', size: 'lg', weight: 'bold', color: '#1e293b' },
           { type: 'text', text: dateStr, size: 'sm', color: '#64748b', margin: 'sm' },
-          { type: 'text', text: '退勤される方は下のボタンを押してください', size: 'sm', color: '#475569', wrap: true, margin: 'lg' },
+          { type: 'text', text: '本日の稼働を終了される方は下のボタンを押してください', size: 'sm', color: '#475569', wrap: true, margin: 'lg' },
         ],
       },
       footer: {
@@ -88,7 +95,7 @@ function buildClockOutMessage(dateStr: string): Message {
         contents: [
           {
             type: 'button',
-            action: { type: 'postback', label: '退勤', data: `action=clock_out&date=${dateStr}`, displayText: '退勤します' },
+            action: { type: 'postback', label: '稼働終了', data: `action=clock_out&date=${dateStr}`, displayText: '稼働を終了します' },
             style: 'primary', color: '#334155', height: 'md',
           },
         ],
@@ -97,18 +104,42 @@ function buildClockOutMessage(dateStr: string): Message {
   };
 }
 
-function buildMonthlyConfirmMessage(targetMonth: string, totalDays: number, totalHours: number): Message {
+const DOW = ['日', '月', '火', '水', '木', '金', '土'];
+
+function dowJa(dateStr: string): string {
+  const d = new Date(dateStr + 'T00:00:00+09:00');
+  return DOW[d.getUTCDay()];
+}
+
+function buildMonthlyConfirmMessage(targetMonth: string, totalDays: number, totalHours: number, records: FriendClockRecordRow[] = []): Message {
+  const monthLabel = targetMonth.split('-')[1]?.replace(/^0/, '') + '月';
+
+  // 古い順
+  const sorted = [...records].sort((a, b) => a.target_date.localeCompare(b.target_date));
+
+  const recordRows = sorted.map((r) => ({
+    type: 'box' as const, layout: 'horizontal' as const, paddingTop: '6px', paddingBottom: '6px',
+    contents: [
+      { type: 'text', text: `${r.target_date.slice(5).replace('-', '/')} (${dowJa(r.target_date)})`, size: 'xs', color: '#1e293b', flex: 3 },
+      { type: 'text', text: r.clock_in || '--:--', size: 'xs', color: '#475569', flex: 2, align: 'center' },
+      { type: 'text', text: r.clock_out || '--:--', size: 'xs', color: '#475569', flex: 2, align: 'center' },
+      { type: 'text', text: r.work_hours != null ? `${r.work_hours}h` : '-', size: 'xs', weight: 'bold', color: '#1e293b', flex: 2, align: 'end' },
+    ],
+  }));
+
   return {
     type: 'flex',
-    altText: `${targetMonth} 稼働時間確認`,
+    altText: `${monthLabel}の稼働時間のご確認`,
     contents: {
       type: 'bubble',
+      size: 'mega',
       body: {
         type: 'box', layout: 'vertical', paddingAll: '20px',
         contents: [
-          { type: 'text', text: '📊 月次稼働時間の確認', size: 'lg', weight: 'bold', color: '#1e293b' },
-          { type: 'text', text: targetMonth, size: 'sm', color: '#64748b', margin: 'sm' },
+          { type: 'text', text: `${monthLabel}の稼働状況のご確認`, size: 'lg', weight: 'bold', color: '#1e293b', wrap: true },
+          { type: 'text', text: targetMonth, size: 'xs', color: '#94a3b8', margin: 'xs' },
           { type: 'separator', margin: 'lg' },
+          { type: 'text', text: 'お疲れさまでした！\n先月の稼働時間をご確認ください。', size: 'sm', color: '#475569', wrap: true, margin: 'lg' },
           {
             type: 'box', layout: 'vertical', margin: 'lg', paddingAll: '16px', backgroundColor: '#f8fafc', cornerRadius: 'md',
             contents: [
@@ -122,14 +153,28 @@ function buildMonthlyConfirmMessage(targetMonth: string, totalDays: number, tota
               ]},
             ],
           },
-          { type: 'text', text: '内容に問題がなければ「確認OK」を押してください。', size: 'xs', color: '#64748b', wrap: true, margin: 'lg' },
+          ...(recordRows.length > 0 ? [
+            { type: 'text' as const, text: '稼働日の内訳', size: 'sm' as const, weight: 'bold' as const, color: '#475569', margin: 'lg' as const },
+            {
+              type: 'box' as const, layout: 'horizontal' as const, margin: 'sm' as const, paddingBottom: '4px',
+              contents: [
+                { type: 'text' as const, text: '日付', size: 'xxs' as const, color: '#94a3b8', flex: 3 },
+                { type: 'text' as const, text: '開始', size: 'xxs' as const, color: '#94a3b8', flex: 2, align: 'center' as const },
+                { type: 'text' as const, text: '終了', size: 'xxs' as const, color: '#94a3b8', flex: 2, align: 'center' as const },
+                { type: 'text' as const, text: '時間', size: 'xxs' as const, color: '#94a3b8', flex: 2, align: 'end' as const },
+              ],
+            },
+            { type: 'separator' as const, margin: 'xs' as const },
+            ...recordRows,
+          ] : []),
+          { type: 'text', text: 'こちらの稼働時間でお間違いないでしょうか？\n間違いがあれば「修正依頼」を押してください。担当者よりご連絡いたします。', size: 'xs', color: '#64748b', wrap: true, margin: 'lg' },
         ],
       },
       footer: {
-        type: 'box', layout: 'horizontal', paddingAll: '12px', spacing: 'md',
+        type: 'box', layout: 'vertical', paddingAll: '12px', spacing: 'sm',
         contents: [
-          { type: 'button', flex: 1, action: { type: 'postback', label: '確認OK', data: `action=monthly_confirm&month=${targetMonth}`, displayText: '確認OKです' }, style: 'primary', color: '#06C755', height: 'sm' },
-          { type: 'button', flex: 1, action: { type: 'postback', label: '修正依頼', data: `action=monthly_revision&month=${targetMonth}`, displayText: '修正をお願いします' }, style: 'secondary', height: 'sm' },
+          { type: 'button', action: { type: 'postback', label: '間違いありません', data: `action=monthly_confirm&month=${targetMonth}`, displayText: '間違いありません' }, style: 'primary', color: '#06C755', height: 'md' },
+          { type: 'button', action: { type: 'postback', label: '修正依頼', data: `action=monthly_revision&month=${targetMonth}`, displayText: '修正をお願いします' }, style: 'secondary', height: 'md' },
         ],
       },
     },
@@ -137,15 +182,188 @@ function buildMonthlyConfirmMessage(targetMonth: string, totalDays: number, tota
 }
 
 /**
- * メイン: 1:1チャット勤怠の定期処理
+ * 長期不在検知: 過去14日間で連続5稼働日以上打刻がない対象者をCSに通知
+ */
+async function checkLongAbsence(
+  db: D1Database,
+  lineClient: LineClient,
+  targets: AttendanceTarget[],
+  config: AttendanceConfigRow,
+  todayStr: string,
+): Promise<void> {
+  if (!config.cs_notification_group_id) return;
+
+  const today = new Date(todayStr + 'T00:00:00+09:00');
+  const fourteenDaysAgo = new Date(today.getTime() - 14 * 86400_000);
+  const startDate = fourteenDaysAgo.toISOString().slice(0, 10);
+
+  for (const target of targets) {
+    try {
+      // 過去14日間の稼働日リスト
+      const workDays: string[] = [];
+      for (let i = 14; i > 0; i--) {
+        const d = new Date(today.getTime() - i * 86400_000);
+        const ds = d.toISOString().slice(0, 10);
+        if (isWorkDay(ds, target.work_days, target.exclude_holidays === 1)) {
+          // 休み報告も除外
+          const absence = await getFriendAbsence(db, target.friend_id, ds);
+          if (!absence) workDays.push(ds);
+        }
+      }
+
+      if (workDays.length < 5) continue; // 過去14日に稼働日5日未満ならスキップ
+
+      // 過去14日の打刻記録
+      const records = await getFriendClockRecords(db, {
+        friendId: target.friend_id, startDate, endDate: todayStr,
+      });
+      const clockedDates = new Set(records.filter(r => r.clock_in).map(r => r.target_date));
+
+      // 連続未打刻の稼働日数
+      let missedCount = 0;
+      for (const wd of workDays.slice().reverse()) {
+        if (clockedDates.has(wd)) break;
+        missedCount++;
+      }
+      if (missedCount < 5) continue;
+
+      // 重複通知チェック（過去7日以内に通知済みならスキップ）
+      const lastAlert = await getLastAbsenceAlert(db, target.friend_id, 'long_absence');
+      if (lastAlert) {
+        const last = new Date(lastAlert.alerted_at + 'Z');
+        if (today.getTime() - last.getTime() < 7 * 86400_000) continue;
+      }
+
+      // CS通知
+      await lineClient.pushMessage(config.cs_notification_group_id, [{
+        type: 'flex',
+        altText: `${target.display_name || '稼働者'}さんが${missedCount}稼働日連続で未打刻`,
+        contents: {
+          type: 'bubble',
+          body: {
+            type: 'box', layout: 'vertical', paddingAll: '20px',
+            contents: [
+              { type: 'text', text: '🚨 長期未打刻のアラート', size: 'lg', weight: 'bold', color: '#dc2626' },
+              { type: 'separator', margin: 'lg' },
+              {
+                type: 'box', layout: 'vertical', margin: 'lg', spacing: 'sm',
+                contents: [
+                  { type: 'box', layout: 'horizontal', contents: [
+                    { type: 'text', text: '稼働者', size: 'sm', color: '#64748b', flex: 2 },
+                    { type: 'text', text: target.display_name || '(不明)', size: 'sm', weight: 'bold', color: '#1e293b', flex: 3, wrap: true },
+                  ]},
+                  { type: 'box', layout: 'horizontal', contents: [
+                    { type: 'text', text: '連続未打刻', size: 'sm', color: '#64748b', flex: 2 },
+                    { type: 'text', text: `${missedCount}稼働日`, size: 'sm', weight: 'bold', color: '#dc2626', flex: 3 },
+                  ]},
+                ],
+              },
+              { type: 'text', text: '稼働者にご連絡し、状況を確認してください。', size: 'xs', color: '#64748b', wrap: true, margin: 'lg' },
+            ],
+          },
+        },
+      }]);
+
+      await insertAbsenceAlert(db, target.friend_id, 'long_absence', `missed=${missedCount}`);
+    } catch (err) {
+      console.error(`Long absence check failed for ${target.line_user_id}:`, err);
+    }
+  }
+}
+
+/**
+ * 朝の Kintone 状況同期 (8:45)
+ * 紐付け済み友だちの「状況」を取得し friend_shifts.kintone_status に保存
+ */
+async function syncKintoneStatuses(db: D1Database, kintoneApiToken: string): Promise<void> {
+  const linked = await getKintoneLinkedFriends(db);
+  if (linked.length === 0) return;
+
+  const recordIds = [...new Set(linked.map(f => f.kintone_id))];
+  const statusMap = await fetchKintoneWorkerStatuses(kintoneApiToken, recordIds);
+
+  for (const f of linked) {
+    const status = statusMap.get(f.kintone_id);
+    if (status === undefined) continue;
+    try {
+      await updateFriendKintoneStatus(db, f.friend_id, status);
+    } catch (err) {
+      console.error(`Kintone status update failed for friend ${f.friend_id}:`, err);
+    }
+  }
+}
+
+/**
+ * 未打刻者一覧を CS 通知グループに送信
+ */
+async function notifyUnclockedFriends(
+  db: D1Database,
+  lineClient: LineClient,
+  config: AttendanceConfigRow,
+  dateStr: string,
+): Promise<void> {
+  if (!config.cs_notification_group_id) return;
+
+  const unclocked = await getUnclockedFriends(db, dateStr, 'clock_in', config.line_account_id);
+  if (unclocked.length === 0) {
+    await lineClient.pushMessage(config.cs_notification_group_id, [{
+      type: 'text',
+      text: `✅ ${dateStr} 全員が稼働開始打刻済みです。`,
+    }]);
+    return;
+  }
+
+  const nameLines = unclocked
+    .map((f, i) => `${i + 1}. ${f.display_name || '(名前未設定)'}`)
+    .join('\n');
+
+  await lineClient.pushMessage(config.cs_notification_group_id, [{
+    type: 'flex',
+    altText: `${dateStr} 未打刻 ${unclocked.length}名`,
+    contents: {
+      type: 'bubble',
+      body: {
+        type: 'box', layout: 'vertical', paddingAll: '20px',
+        contents: [
+          { type: 'text', text: '⏰ 本日の未打刻者', size: 'lg', weight: 'bold', color: '#dc2626' },
+          { type: 'text', text: dateStr, size: 'xs', color: '#94a3b8', margin: 'xs' },
+          { type: 'separator', margin: 'lg' },
+          {
+            type: 'box', layout: 'horizontal', margin: 'lg',
+            contents: [
+              { type: 'text', text: '未打刻人数', size: 'sm', color: '#64748b', flex: 2 },
+              { type: 'text', text: `${unclocked.length}名`, size: 'sm', weight: 'bold', color: '#dc2626', flex: 3 },
+            ],
+          },
+          { type: 'separator', margin: 'lg' },
+          { type: 'text', text: nameLines, size: 'sm', color: '#1e293b', wrap: true, margin: 'lg' },
+          { type: 'text', text: '※ 参画中・本日が稼働日・休み報告なしの方のうち、稼働開始打刻がない方を表示しています。', size: 'xxs', color: '#94a3b8', wrap: true, margin: 'lg' },
+        ],
+      },
+    },
+  }]);
+}
+
+/**
+ * メイン: 1:1チャット稼働記録の定期処理
  */
 export async function processFriendAttendanceClock(
   db: D1Database,
   lineClient: LineClient,
+  kintoneApiToken?: string,
 ): Promise<void> {
   const { hour, minute, dateStr, monthStr, day } = jstTimeNow();
   const configs = await getAllAttendanceConfigs(db);
   if (configs.length === 0) return;
+
+  // 朝の Kintone 同期（8:45）— 全アカウント共通で1日1回
+  if (kintoneApiToken && isTimeWindow(hour, minute, '08:45')) {
+    try {
+      await syncKintoneStatuses(db, kintoneApiToken);
+    } catch (err) {
+      console.error('Kintone sync failed:', err);
+    }
+  }
 
   for (const config of configs) {
     try {
@@ -153,8 +371,12 @@ export async function processFriendAttendanceClock(
       if (targets.length === 0) continue;
 
       for (const target of targets) {
-        // 勤務日チェック
+        // 稼働日チェック
         if (!isWorkDay(dateStr, target.work_days, target.exclude_holidays === 1)) continue;
+
+        // 休み報告チェック
+        const absence = await getFriendAbsence(db, target.friend_id, dateStr);
+        if (absence) continue;
 
         const clockInTime = getEffectiveTime(target, config, 'clock_in_time');
         const clockInReminderTime = getEffectiveTime(target, config, 'clock_in_reminder_time');
@@ -162,24 +384,24 @@ export async function processFriendAttendanceClock(
         const clockOutReminderTime = getEffectiveTime(target, config, 'clock_out_reminder_time');
 
         try {
-          // ── 出勤ボタン ──
+          // ── 稼働開始ボタン ──
           if (isTimeWindow(hour, minute, clockInTime)) {
             await lineClient.pushMessage(target.line_user_id, [buildClockInMessage(dateStr)]);
           }
 
-          // ── 出勤リマインド ──
+          // ── 稼働開始リマインド ──
           if (isTimeWindow(hour, minute, clockInReminderTime)) {
             const record = await getFriendClockRecord(db, target.friend_id, dateStr);
             if (!record?.clock_in) {
               await lineClient.pushMessage(target.line_user_id, [{
                 type: 'text',
-                text: `本日の出勤打刻がまだのようです。\n何時に出勤されましたか？（例: 9:00、9時）`,
+                text: `本日の稼働開始がまだ記録されていません。\n何時から稼働開始されましたか？（例: 9:00、9時）`,
               }]);
               await insertFriendClockReminder(db, target.friend_id, 'clock_in', dateStr);
             }
           }
 
-          // ── 退勤ボタン ──
+          // ── 稼働終了ボタン ──
           if (isTimeWindow(hour, minute, clockOutTime)) {
             const record = await getFriendClockRecord(db, target.friend_id, dateStr);
             if (record?.clock_in && !record?.clock_out) {
@@ -187,13 +409,13 @@ export async function processFriendAttendanceClock(
             }
           }
 
-          // ── 退勤リマインド ──
+          // ── 稼働終了リマインド ──
           if (isTimeWindow(hour, minute, clockOutReminderTime)) {
             const record = await getFriendClockRecord(db, target.friend_id, dateStr);
             if (record?.clock_in && !record?.clock_out) {
               await lineClient.pushMessage(target.line_user_id, [{
                 type: 'text',
-                text: `本日の退勤打刻がまだのようです。\n何時に退勤されましたか？（例: 18:00、18時）`,
+                text: `本日の稼働終了がまだ記録されていません。\n何時に稼働終了されましたか？（例: 18:00、18時）`,
               }]);
               await insertFriendClockReminder(db, target.friend_id, 'clock_out', dateStr);
             }
@@ -202,6 +424,20 @@ export async function processFriendAttendanceClock(
           // 個人へのpush失敗（ブロック等）は無視して次へ
           console.error(`Attendance push failed for ${target.line_user_id}:`, err);
         }
+      }
+
+      // ── 未打刻者一覧 (11:00 に CS グループへ) ──
+      if (isTimeWindow(hour, minute, '11:00') && config.cs_notification_group_id) {
+        try {
+          await notifyUnclockedFriends(db, lineClient, config, dateStr);
+        } catch (err) {
+          console.error('Unclocked notify failed:', err);
+        }
+      }
+
+      // ── 長期不在検知 (10:00に1日1回チェック) ──
+      if (isTimeWindow(hour, minute, '10:00') && config.cs_notification_group_id) {
+        await checkLongAbsence(db, lineClient, targets, config, dateStr);
       }
 
       // ── 月初: 前月サマリー送信 ──
@@ -215,7 +451,12 @@ export async function processFriendAttendanceClock(
             const summary = await calcFriendMonthlySummary(db, target.friend_id, prevMonthStr);
             if (summary.totalDays > 0) {
               await upsertFriendMonthlyConfirmation(db, target.friend_id, target.display_name, prevMonthStr, summary.totalDays, summary.totalHours);
-              await lineClient.pushMessage(target.line_user_id, [buildMonthlyConfirmMessage(prevMonthStr, summary.totalDays, summary.totalHours)]);
+              const records = await getFriendClockRecords(db, {
+                friendId: target.friend_id,
+                startDate: prevMonthStr + '-01',
+                endDate: prevMonthStr + '-31',
+              });
+              await lineClient.pushMessage(target.line_user_id, [buildMonthlyConfirmMessage(prevMonthStr, summary.totalDays, summary.totalHours, records)]);
             }
           } catch (err) {
             console.error(`Monthly confirm failed for ${target.line_user_id}:`, err);

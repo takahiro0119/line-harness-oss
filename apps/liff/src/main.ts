@@ -128,32 +128,27 @@ function showFriendAdd(profile: { displayName: string; pictureUrl?: string }) {
   });
 }
 
-function showCompletion(profile: { displayName: string; pictureUrl?: string }, isRecovery: boolean) {
+function showCompletion(profile: { displayName: string; pictureUrl?: string }, _isRecovery: boolean) {
   const container = document.getElementById('app')!;
-  const ref = getRef();
   container.innerHTML = `
     <div class="card">
-      <div class="check-icon">${isRecovery ? '🔄' : '✓'}</div>
-      <h2>${isRecovery ? 'おかえりなさい！' : '登録完了！'}</h2>
-      <div class="profile">
-        ${profile.pictureUrl ? `<img src="${profile.pictureUrl}" alt="" />` : ''}
-        <p class="name">${escapeHtml(profile.displayName)} さん</p>
-      </div>
-      <p class="message">
-        ${isRecovery
-          ? '以前のアカウント情報を引き継ぎました。'
-          : 'ありがとうございます！これからお役立ち情報をお届けします。'
-        }
-        <br>このページは閉じて大丈夫です。
+      <div class="loading-spinner" style="margin: 0 auto 16px;"></div>
+      <p class="message" style="text-align: center;">
+        そのままお待ちください<br>
+        <span style="font-size: 12px; color: #94a3b8;">LINEに移動します...</span>
       </p>
-      ${ref ? `<p class="ref-badge">${escapeHtml(ref)}</p>` : ''}
     </div>
   `;
 
   // 2秒後にトーク画面に遷移
   setTimeout(() => {
     // LINE内でもブラウザでも、トーク画面URLに遷移
-    window.location.href = 'https://line.me/R/oaMessage/@086cdqiw/';
+    if (BOT_BASIC_ID) {
+      window.location.href = `https://line.me/R/oaMessage/${BOT_BASIC_ID}/`;
+    } else {
+      // Basic ID未設定: LIFF closeWindowでLINEアプリに戻すだけ
+      try { liff.closeWindow(); } catch { /* ignore */ }
+    }
   }, 2000);
 }
 

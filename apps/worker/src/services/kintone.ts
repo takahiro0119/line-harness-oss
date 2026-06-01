@@ -13,7 +13,8 @@ interface KintoneRecord {
   電話番号: { value: string };
   フリガナ: { value: string };
   メールアドレス: { value: string };
-  [key: string]: { value: string | unknown };
+  状況?: { value: string };
+  [key: string]: { value: string | unknown } | undefined;
 }
 
 interface KintoneSearchResult {
@@ -28,6 +29,58 @@ export interface KintoneWorker {
   phone: string;
   furigana: string;
   email: string;
+  status: string;
+}
+
+const COMMON_FIELDS =
+  'fields[0]=レコード番号&fields[1]=氏名&fields[2]=生年月日&fields[3]=電話番号&fields[4]=フリガナ&fields[5]=メールアドレス&fields[6]=状況';
+
+function toWorker(r: KintoneRecord): KintoneWorker {
+  return {
+    recordId: r['レコード番号'].value as string,
+    name: r['氏名'].value as string,
+    birthday: r['生年月日'].value as string,
+    phone: r['電話番号'].value as string,
+    furigana: r['フリガナ'].value as string,
+    email: r['メールアドレス'].value as string,
+    status: (r['状況']?.value as string) || '',
+  };
+}
+
+/**
+ * レコード番号から「状況」だけ引く（日次同期用）
+ */
+export async function fetchKintoneWorkerStatuses(
+  apiToken: string,
+  recordIds: string[],
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  if (recordIds.length === 0) return result;
+
+  // Kintone のクエリは長くなるので 100 件ずつ分割
+  const chunkSize = 100;
+  for (let i = 0; i < recordIds.length; i += chunkSize) {
+    const chunk = recordIds.slice(i, i + chunkSize);
+    const query = `レコード番号 in (${chunk.join(',')})`;
+    const url = `https://${KINTONE_SUBDOMAIN}.cybozu.com/k/v1/records.json?app=${KINTONE_APP_ID}&query=${encodeURIComponent(query)}&fields[0]=レコード番号&fields[1]=状況`;
+
+    try {
+      const res = await fetch(url, { headers: { 'X-Cybozu-API-Token': apiToken } });
+      if (!res.ok) {
+        console.error('Kintone status fetch error:', res.status, await res.text());
+        continue;
+      }
+      const data = await res.json() as KintoneSearchResult;
+      for (const r of data.records) {
+        const id = r['レコード番号'].value as string;
+        const status = (r['状況']?.value as string) || '';
+        result.set(id, status);
+      }
+    } catch (err) {
+      console.error('Kintone status fetch failed:', err);
+    }
+  }
+  return result;
 }
 
 /**
@@ -41,7 +94,7 @@ export async function searchKintoneWorker(
   // クエリ: 氏名に一致 AND 生年月日に一致
   const query = `氏名 = "${escapeKintoneQuery(name)}" and 生年月日 = "${birthday}"`;
 
-  const url = `https://${KINTONE_SUBDOMAIN}.cybozu.com/k/v1/records.json?app=${KINTONE_APP_ID}&query=${encodeURIComponent(query)}&fields[0]=レコード番号&fields[1]=氏名&fields[2]=生年月日&fields[3]=電話番号&fields[4]=フリガナ&fields[5]=メールアドレス`;
+  const url = `https://${KINTONE_SUBDOMAIN}.cybozu.com/k/v1/records.json?app=${KINTONE_APP_ID}&query=${encodeURIComponent(query)}&${COMMON_FIELDS}`;
 
   try {
     const res = await fetch(url, {
@@ -59,15 +112,7 @@ export async function searchKintoneWorker(
       return searchKintoneWorkerPartial(apiToken, name, birthday);
     }
 
-    const r = data.records[0];
-    return {
-      recordId: r['レコード番号'].value as string,
-      name: r['氏名'].value as string,
-      birthday: r['生年月日'].value as string,
-      phone: r['電話番号'].value as string,
-      furigana: r['フリガナ'].value as string,
-      email: r['メールアドレス'].value as string,
-    };
+    return toWorker(data.records[0]);
   } catch (err) {
     console.error('Kintone search failed:', err);
     return null;
@@ -86,7 +131,7 @@ async function searchKintoneWorkerPartial(
   const nameNoSpace = name.replace(/[\s　]/g, '');
   const query = `氏名 like "${escapeKintoneQuery(nameNoSpace)}" and 生年月日 = "${birthday}"`;
 
-  const url = `https://${KINTONE_SUBDOMAIN}.cybozu.com/k/v1/records.json?app=${KINTONE_APP_ID}&query=${encodeURIComponent(query)}&fields[0]=レコード番号&fields[1]=氏名&fields[2]=生年月日&fields[3]=電話番号&fields[4]=フリガナ&fields[5]=メールアドレス`;
+  const url = `https://${KINTONE_SUBDOMAIN}.cybozu.com/k/v1/records.json?app=${KINTONE_APP_ID}&query=${encodeURIComponent(query)}&${COMMON_FIELDS}`;
 
   try {
     const res = await fetch(url, {
@@ -101,15 +146,7 @@ async function searchKintoneWorkerPartial(
       return searchByBirthdayOnly(apiToken, birthday, name);
     }
 
-    const r = data.records[0];
-    return {
-      recordId: r['レコード番号'].value as string,
-      name: r['氏名'].value as string,
-      birthday: r['生年月日'].value as string,
-      phone: r['電話番号'].value as string,
-      furigana: r['フリガナ'].value as string,
-      email: r['メールアドレス'].value as string,
-    };
+    return toWorker(data.records[0]);
   } catch {
     return null;
   }
@@ -124,7 +161,7 @@ async function searchByBirthdayOnly(
   inputName: string,
 ): Promise<KintoneWorker | null> {
   const query = `生年月日 = "${birthday}"`;
-  const url = `https://${KINTONE_SUBDOMAIN}.cybozu.com/k/v1/records.json?app=${KINTONE_APP_ID}&query=${encodeURIComponent(query)}&fields[0]=レコード番号&fields[1]=氏名&fields[2]=生年月日&fields[3]=電話番号&fields[4]=フリガナ&fields[5]=メールアドレス`;
+  const url = `https://${KINTONE_SUBDOMAIN}.cybozu.com/k/v1/records.json?app=${KINTONE_APP_ID}&query=${encodeURIComponent(query)}&${COMMON_FIELDS}`;
 
   try {
     const res = await fetch(url, {
@@ -160,14 +197,7 @@ async function searchByBirthdayOnly(
 
     // スコアが50以上なら返す
     if (bestMatch && bestScore >= 50) {
-      return {
-        recordId: bestMatch['レコード番号'].value as string,
-        name: bestMatch['氏名'].value as string,
-        birthday: bestMatch['生年月日'].value as string,
-        phone: bestMatch['電話番号'].value as string,
-        furigana: bestMatch['フリガナ'].value as string,
-        email: bestMatch['メールアドレス'].value as string,
-      };
+      return toWorker(bestMatch);
     }
 
     return null;

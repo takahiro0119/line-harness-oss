@@ -6,6 +6,7 @@ export interface EntryRoute {
   tag_id: string | null;
   scenario_id: string | null;
   redirect_url: string | null;
+  onboarding_flow: string | null;
   is_active: number;
   created_at: string;
   updated_at: string;
@@ -35,6 +36,7 @@ export interface CreateEntryRouteInput {
   tagId?: string | null;
   scenarioId?: string | null;
   redirectUrl?: string | null;
+  onboardingFlow?: string | null;
   isActive?: boolean;
 }
 
@@ -66,8 +68,8 @@ export async function createEntryRoute(
   await db
     .prepare(
       `INSERT INTO entry_routes
-         (id, ref_code, name, tag_id, scenario_id, redirect_url, is_active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, ref_code, name, tag_id, scenario_id, redirect_url, onboarding_flow, is_active, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       id,
@@ -76,6 +78,7 @@ export async function createEntryRoute(
       input.tagId ?? null,
       input.scenarioId ?? null,
       input.redirectUrl ?? null,
+      input.onboardingFlow ?? null,
       isActive,
       now,
       now,
@@ -102,6 +105,7 @@ export async function updateEntryRoute(
   if (input.tagId !== undefined) { fields.push('tag_id = ?'); values.push(input.tagId ?? null); }
   if (input.scenarioId !== undefined) { fields.push('scenario_id = ?'); values.push(input.scenarioId ?? null); }
   if (input.redirectUrl !== undefined) { fields.push('redirect_url = ?'); values.push(input.redirectUrl ?? null); }
+  if (input.onboardingFlow !== undefined) { fields.push('onboarding_flow = ?'); values.push(input.onboardingFlow ?? null); }
   if (input.isActive !== undefined) { fields.push('is_active = ?'); values.push(input.isActive ? 1 : 0); }
 
   values.push(id);

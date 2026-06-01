@@ -10,6 +10,8 @@ import {
   createFriendOnboarding,
   updateOnboardingStep,
   getEntryRouteOnboardingFlow,
+  upsertFriendShift,
+  updateFriendKintoneStatus,
 } from '@line-crm/db';
 import { searchKintoneWorker } from './kintone.js';
 import type { KintoneWorker } from './kintone.js';
@@ -24,26 +26,102 @@ export async function startOnboardingIfNeeded(
   friendId: string,
   refCode: string | null,
   replyToken: string,
+  liffId?: string,
+): Promise<boolean> {
+  return triggerOnboardingFlow(db, lineClient, friendId, refCode, { replyToken, liffId });
+}
+
+/**
+ * 既存友達がリンクを踏んだ時: pushMessageでオンボーディングを再開（または別フロー起動）
+ */
+export async function pushOnboardingForRef(
+  db: D1Database,
+  lineClient: LineClient,
+  friendId: string,
+  lineUserId: string,
+  refCode: string | null,
+  liffId?: string,
+): Promise<boolean> {
+  return triggerOnboardingFlow(db, lineClient, friendId, refCode, { pushToLineUserId: lineUserId, liffId });
+}
+
+async function triggerOnboardingFlow(
+  db: D1Database,
+  lineClient: LineClient,
+  friendId: string,
+  refCode: string | null,
+  opts: { replyToken?: string; pushToLineUserId?: string; liffId?: string },
 ): Promise<boolean> {
   if (!refCode) return false;
 
   const flowType = await getEntryRouteOnboardingFlow(db, refCode);
   if (!flowType) return false;
 
-  // オンボーディング開始
-  await createFriendOnboarding(db, friendId, flowType);
+  const existing = await getFriendOnboarding(db, friendId);
+  if (existing && existing.flow_type === flowType && existing.completed) {
+    return false;
+  }
+  if (!existing || existing.flow_type !== flowType) {
+    await createFriendOnboarding(db, friendId, flowType);
+  }
+
+  const { replyToken, pushToLineUserId, liffId } = opts;
+  const sendMessage = async (messages: Message[]): Promise<void> => {
+    if (replyToken) {
+      await lineClient.replyMessage(replyToken, messages);
+    } else if (pushToLineUserId) {
+      await lineClient.pushMessage(pushToLineUserId, messages);
+    }
+  };
 
   if (flowType === 'bpo_worker') {
-    await lineClient.replyMessage(replyToken, [
+    await sendMessage([
       {
         type: 'text',
-        text: '友だち登録ありがとうございます！\n\n勤怠管理のため、いくつか確認させてください。\n\nまず、お名前をフルネームで教えてください。\n（例: 山田太郎）',
+        text: '稼働状況の記録のため、いくつか確認させてください。\n\nまず、お名前をフルネームで教えてください。\n（例: 山田太郎）',
       },
     ]);
     return true;
   }
 
-  // 他のフロータイプは今後追加
+  if (flowType === 'bpo_new_worker') {
+    const formUrl = liffId
+      ? `https://liff.line.me/${liffId}?page=form&id=skill_sheet`
+      : '';
+    await sendMessage([
+      {
+        type: 'flex',
+        altText: 'スキルシートのご記入をお願いします',
+        contents: {
+          type: 'bubble',
+          body: {
+            type: 'box', layout: 'vertical', paddingAll: '20px',
+            contents: [
+              { type: 'text', text: '🎉 ご登録ありがとうございます！', size: 'md', weight: 'bold', color: '#1e293b', wrap: true },
+              { type: 'separator', margin: 'lg' },
+              { type: 'text', text: '案件参画にあたり、以下のスキルシートにご記入をお願いいたします。', size: 'sm', color: '#475569', wrap: true, margin: 'lg' },
+              { type: 'text', text: '・基本情報\n・スキル評価\n・職務経歴', size: 'xs', color: '#64748b', wrap: true, margin: 'md' },
+              { type: 'box', layout: 'vertical', margin: 'lg', paddingAll: '10px', backgroundColor: '#eff6ff', cornerRadius: 'md',
+                contents: [
+                  { type: 'text', text: '※ 入力した内容は弊社で稼働者情報として管理させていただきます', size: 'xxs', color: '#1e40af', wrap: true },
+                ],
+              },
+            ],
+          },
+          footer: {
+            type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
+            contents: [
+              formUrl
+                ? { type: 'button', action: { type: 'uri', label: 'スキルシートを記入する', uri: formUrl }, style: 'primary', color: '#06C755', height: 'md' }
+                : { type: 'text', text: 'フォームURLを担当者にお問い合わせください', size: 'xs', color: '#64748b' },
+            ],
+          },
+        },
+      },
+    ]);
+    return true;
+  }
+
   return false;
 }
 
@@ -129,6 +207,11 @@ async function handleBpoWorkerFlow(
           birthday,
           kintoneId: kintoneWorker.recordId,
         });
+        // 稼働対象として登録（既存稼働者）
+        await upsertFriendShift(db, friendId, { pattern_type: 'default', work_days: '1,2,3,4,5', exclude_holidays: 1, is_excluded: 0 });
+        if (kintoneWorker.status) {
+          await updateFriendKintoneStatus(db, friendId, kintoneWorker.status);
+        }
 
         await lineClient.replyMessage(replyToken, [{
           type: 'flex',
@@ -153,7 +236,7 @@ async function handleBpoWorkerFlow(
                     ]},
                   ],
                 },
-                { type: 'text', text: '稼働者情報との紐付けが完了しました。\n下のメニューから出勤・退勤の打刻ができます。', size: 'xs', color: '#64748b', wrap: true, margin: 'lg' },
+                { type: 'text', text: '稼働者情報との紐付けが完了しました。\n下のメニューから稼働開始・終了の記録ができます。', size: 'xs', color: '#64748b', wrap: true, margin: 'lg' },
               ],
             },
           },
@@ -161,6 +244,8 @@ async function handleBpoWorkerFlow(
       } else {
         // 名寄せ失敗
         await updateOnboardingStep(db, friendId, 'complete', { birthday });
+        // 稼働対象として登録（名寄せ失敗でも対象にしておく：担当者確認後に紐付け）
+        await upsertFriendShift(db, friendId, { pattern_type: 'default', work_days: '1,2,3,4,5', exclude_holidays: 1, is_excluded: 0 });
 
         await lineClient.replyMessage(replyToken, [{
           type: 'flex',
@@ -191,7 +276,7 @@ async function handleBpoWorkerFlow(
                     { type: 'text', text: '⚠️ 稼働者情報との自動紐付けができませんでした。担当者が確認いたします。', size: 'xs', color: '#92400e', wrap: true },
                   ],
                 },
-                { type: 'text', text: '下のメニューから出勤・退勤の打刻は可能です。', size: 'xs', color: '#64748b', wrap: true, margin: 'md' },
+                { type: 'text', text: '下のメニューから稼働開始・終了の記録は可能です。', size: 'xs', color: '#64748b', wrap: true, margin: 'md' },
               ],
             },
           },

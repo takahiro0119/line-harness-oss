@@ -11,9 +11,16 @@ const WORKER_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8787'
 interface RefRoute {
   refCode: string
   name: string
+  onboardingFlow: string | null
   friendCount: number
   clickCount: number
   latestAt: string | null
+}
+
+function onboardingFlowLabel(flow: string | null): string {
+  if (flow === 'bpo_worker') return 'BPO稼働者（既存）'
+  if (flow === 'bpo_new_worker') return 'BPO稼働者（新規）'
+  return '—'
 }
 
 interface RefSummaryData {
@@ -43,6 +50,11 @@ export default function AttributionPage() {
   const [detail, setDetail] = useState<RefDetailData | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [copiedCode, setCopiedCode] = useState<string | null>(null)
+  const [showCreate, setShowCreate] = useState(false)
+  const [createName, setCreateName] = useState('')
+  const [createFlow, setCreateFlow] = useState<'' | 'bpo_worker' | 'bpo_new_worker'>('')
+  const [createSubmitting, setCreateSubmitting] = useState(false)
+  const [createError, setCreateError] = useState<string | null>(null)
 
   const loadSummary = useCallback(async () => {
     setLoading(true)
@@ -82,6 +94,43 @@ export default function AttributionPage() {
     setDetailLoading(false)
   }
 
+  const handleCreate = async () => {
+    setCreateError(null)
+    if (!createName.trim()) {
+      setCreateError('経路名は必須です')
+      return
+    }
+    setCreateSubmitting(true)
+    try {
+      const apiKey = typeof window !== 'undefined' ? localStorage.getItem('lh_api_key') || '' : ''
+      const res = await fetch(`${WORKER_BASE}/api/entry-routes`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          name: createName.trim(),
+          onboardingFlow: createFlow || null,
+          isActive: true,
+        }),
+      })
+      const json = (await res.json().catch(() => ({}))) as { success?: boolean; error?: string }
+      if (!res.ok || !json.success) {
+        setCreateError(json.error || `作成に失敗しました (${res.status})`)
+        return
+      }
+      setShowCreate(false)
+      setCreateName('')
+      setCreateFlow('')
+      await loadSummary()
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : '作成に失敗しました')
+    } finally {
+      setCreateSubmitting(false)
+    }
+  }
+
   const handleCopy = async (refCode: string) => {
     const url = `${WORKER_BASE}/auth/line?ref=${encodeURIComponent(refCode)}`
     await navigator.clipboard.writeText(url)
@@ -100,6 +149,82 @@ export default function AttributionPage() {
         title="流入経路分析"
         description="ref コード別の友だち獲得・クリック実績"
       />
+
+      <div className="flex justify-end mb-4">
+        <button
+          onClick={() => setShowCreate(true)}
+          className="bg-green-600 hover:bg-green-700 text-white text-sm font-medium px-4 py-2 rounded-lg"
+        >
+          + 経路を作成
+        </button>
+      </div>
+
+      {showCreate && (
+        <div
+          className="fixed inset-0 bg-black/40 flex items-center justify-center z-50"
+          onClick={() => !createSubmitting && setShowCreate(false)}
+        >
+          <div
+            className="bg-white rounded-xl p-6 w-full max-w-md mx-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-lg font-bold text-gray-900 mb-4">流入経路を作成</h2>
+
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  経路名 <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={createName}
+                  onChange={(e) => setCreateName(e.target.value)}
+                  placeholder="既存稼働者 登録用"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  オンボーディングフロー
+                </label>
+                <select
+                  value={createFlow}
+                  onChange={(e) => setCreateFlow(e.target.value as '' | 'bpo_worker' | 'bpo_new_worker')}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-green-500 bg-white"
+                >
+                  <option value="">なし（通常登録）</option>
+                  <option value="bpo_worker">BPO稼働者・既存（名前/生年月日でKintone名寄せ）</option>
+                  <option value="bpo_new_worker">BPO稼働者・新規（スキルシート記入）</option>
+                </select>
+              </div>
+
+              <p className="text-xs text-gray-400">ref コードは自動生成されます（作成後にURLをコピー可能）</p>
+
+              {createError && (
+                <p className="text-sm text-red-600 bg-red-50 rounded-md px-3 py-2">{createError}</p>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 mt-6">
+              <button
+                onClick={() => setShowCreate(false)}
+                disabled={createSubmitting}
+                className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg disabled:opacity-50"
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={handleCreate}
+                disabled={createSubmitting}
+                className="bg-green-600 hover:bg-green-700 text-white text-sm font-medium px-4 py-2 rounded-lg disabled:opacity-50"
+              >
+                {createSubmitting ? '作成中...' : '作成'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Summary cards */}
       {summary && (
@@ -139,6 +264,7 @@ export default function AttributionPage() {
               <tr>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">ref コード</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">経路名</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">フロー</th>
                 <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">友だち数</th>
                 <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">クリック数</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">最新追加日</th>
@@ -158,6 +284,19 @@ export default function AttributionPage() {
                     >
                       <td className="px-4 py-3 text-sm font-mono text-blue-600">{route.refCode}</td>
                       <td className="px-4 py-3 text-sm font-medium text-gray-900">{route.name}</td>
+                      <td className="px-4 py-3 text-sm">
+                        {route.onboardingFlow ? (
+                          <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
+                            route.onboardingFlow === 'bpo_new_worker'
+                              ? 'bg-blue-100 text-blue-700'
+                              : 'bg-green-100 text-green-700'
+                          }`}>
+                            {onboardingFlowLabel(route.onboardingFlow)}
+                          </span>
+                        ) : (
+                          <span className="text-gray-300">—</span>
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-sm text-right font-semibold text-gray-900">{route.friendCount}</td>
                       <td className="px-4 py-3 text-sm text-right text-gray-600">{route.clickCount}</td>
                       <td className="px-4 py-3 text-sm text-gray-500">{formatDate(route.latestAt)}</td>
@@ -175,7 +314,7 @@ export default function AttributionPage() {
                     </tr>
                     {isExpanded && (
                       <tr key={`${route.refCode}-detail`}>
-                        <td colSpan={6} className="px-6 py-4 bg-gray-50">
+                        <td colSpan={7} className="px-6 py-4 bg-gray-50">
                           {detailLoading ? (
                             <p className="text-sm text-gray-400">読み込み中...</p>
                           ) : detail && detail.friends.length > 0 ? (

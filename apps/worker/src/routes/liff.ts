@@ -100,10 +100,16 @@ liffRoutes.get('/auth/line', async (c) => {
   if (accountParam) qrParams.set('account', accountParam);
   const qrUrl = qrParams.toString() ? `${liffUrl}?${qrParams.toString()}` : liffUrl;
 
+  // リンクプレビューbot検知 → 空レスポンスでカード表示を抑制
+  const uaRaw = c.req.header('user-agent') || '';
+  if (/LinePreview|LineLinkPreview|LineMessengerExternalPreviewer|linethreadcontentchecker|facebookexternalhit|Twitterbot|Slackbot|Discordbot|TelegramBot|WhatsApp|bot|crawl|spider/i.test(uaRaw)) {
+    return new Response('', { status: 204, headers: { 'X-Robots-Tag': 'noindex, nofollow' } });
+  }
+
   // Mobile: redirect to LIFF URL (opens LINE app directly)
   // Exception: cross-account links (account param) use OAuth directly
   // because Account A's LIFF can't open from Account B's LINE chat
-  const ua = (c.req.header('user-agent') || '').toLowerCase();
+  const ua = uaRaw.toLowerCase();
   const isMobile = /iphone|ipad|android|mobile/.test(ua);
   if (isMobile) {
     if (accountParam) {
@@ -113,13 +119,18 @@ liffRoutes.get('/auth/line', async (c) => {
     return c.redirect(qrUrl);
   }
 
-  // PC: show QR code page
+  // PC: show QR code page (OGP/title 空でリンクプレビュー抑制)
   return c.html(`<!DOCTYPE html>
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>LINE で友だち追加</title>
+  <meta name="robots" content="noindex, nofollow">
+  <meta property="og:title" content="">
+  <meta property="og:description" content="">
+  <meta property="og:image" content="">
+  <meta name="twitter:card" content="">
+  <title></title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: 'Hiragino Sans', system-ui, sans-serif; background: #0d1117; color: #fff; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
@@ -129,18 +140,16 @@ liffRoutes.get('/auth/line', async (c) => {
     .qr { background: #fff; border-radius: 16px; padding: 24px; display: inline-block; margin-bottom: 24px; }
     .qr img { display: block; width: 240px; height: 240px; }
     .hint { font-size: 13px; color: rgba(255,255,255,0.4); line-height: 1.6; }
-    .badge { display: inline-block; margin-top: 24px; padding: 8px 20px; border-radius: 20px; font-size: 12px; font-weight: 600; color: #06C755; background: rgba(6,199,85,0.1); border: 1px solid rgba(6,199,85,0.2); }
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>全機能を使う（0円）</h1>
+    <h1>友だち追加</h1>
     <p class="sub">スマートフォンで QR コードを読み取ってください</p>
     <div class="qr">
       <img src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(qrUrl)}" alt="QR Code">
     </div>
     <p class="hint">LINE アプリのカメラまたは<br>スマートフォンのカメラで読み取れます</p>
-    <div class="badge">LINE Harness OSS</div>
   </div>
 </body>
 </html>`);
@@ -554,6 +563,18 @@ liffRoutes.post('/api/liff/link', async (c) => {
     const db = c.env.DB;
     const friend = await getFriendByLineUserId(db, lineUserId);
     if (!friend) {
+      // friend 未登録 → ref_code を退避してから 404 を返す
+      // (後でfollow webhookが受信した際にこの ref を反映する)
+      if (body.ref && !body.ref.startsWith('xh:')) {
+        try {
+          await db.prepare(
+            `INSERT INTO pending_friend_refs (line_user_id, ref_code, display_name) VALUES (?, ?, ?)
+             ON CONFLICT(line_user_id) DO UPDATE SET ref_code = excluded.ref_code, display_name = excluded.display_name, created_at = datetime('now')`
+          ).bind(lineUserId, body.ref, body.displayName ?? null).run();
+        } catch (err) {
+          console.error('Failed to upsert pending_friend_ref:', err);
+        }
+      }
       return c.json({ success: false, error: 'Friend not found' }, 404);
     }
 
@@ -588,6 +609,11 @@ liffRoutes.post('/api/liff/link', async (c) => {
           console.error('X Harness token resolution error (non-blocking):', err);
         }
       }
+      // 既存友達向け: ref に紐づくオンボーディングフローを push 送信
+      if (body.ref && !body.ref.startsWith('xh:')) {
+        c.executionCtx.waitUntil(triggerOnboardingPush(c.env, friend.id, lineUserId, body.ref));
+      }
+
       return c.json({
         success: true,
         data: { userId: (friend as unknown as Record<string, unknown>).user_id, alreadyLinked: true },
@@ -654,6 +680,11 @@ liffRoutes.post('/api/liff/link', async (c) => {
       }
     }
 
+    // user_idを今リンクした既存友達向け: ref に紐づくオンボーディングフローを push 送信
+    if (body.ref && !body.ref.startsWith('xh:')) {
+      c.executionCtx.waitUntil(triggerOnboardingPush(c.env, friend.id, lineUserId, body.ref));
+    }
+
     return c.json({
       success: true,
       data: { userId, alreadyLinked: false },
@@ -663,6 +694,33 @@ liffRoutes.post('/api/liff/link', async (c) => {
     return c.json({ success: false, error: 'Internal server error' }, 500);
   }
 });
+
+async function triggerOnboardingPush(
+  env: Env['Bindings'],
+  friendId: string,
+  lineUserId: string,
+  refCode: string,
+): Promise<void> {
+  try {
+    const { LineClient } = await import('@line-crm/line-sdk');
+    const { pushOnboardingForRef } = await import('../services/onboarding.js');
+    const { getFriendById, getLineAccountById } = await import('@line-crm/db');
+
+    let accessToken = env.LINE_CHANNEL_ACCESS_TOKEN;
+    const friend = await getFriendById(env.DB, friendId);
+    const lineAccountId = (friend as unknown as Record<string, unknown> | null)?.line_account_id as string | undefined;
+    if (lineAccountId) {
+      const account = await getLineAccountById(env.DB, lineAccountId);
+      if (account) accessToken = account.channel_access_token;
+    }
+
+    const lineClient = new LineClient(accessToken);
+    const liffId = env.LIFF_URL?.match(/liff\.line\.me\/([\w-]+)/)?.[1];
+    await pushOnboardingForRef(env.DB, lineClient, friendId, lineUserId, refCode, liffId);
+  } catch (err) {
+    console.error('triggerOnboardingPush failed:', err);
+  }
+}
 
 // ─── Attribution Analytics ──────────────────────────────────────
 
@@ -681,19 +739,21 @@ liffRoutes.get('/api/analytics/ref-summary', async (c) => {
         `SELECT
           er.ref_code,
           er.name,
+          er.onboarding_flow,
           COUNT(DISTINCT rt.friend_id) as friend_count,
           COUNT(rt.id) as click_count,
           MAX(rt.created_at) as latest_at
         FROM entry_routes er
         LEFT JOIN ref_tracking rt ON er.ref_code = rt.ref_code
         LEFT JOIN friends f ON f.id = rt.friend_id ${accountFilter ? `${accountFilter}` : ''}
-        GROUP BY er.ref_code, er.name
+        GROUP BY er.ref_code, er.name, er.onboarding_flow
         ORDER BY friend_count DESC`,
       )
       .bind(...accountBinds)
       .all<{
         ref_code: string;
         name: string;
+        onboarding_flow: string | null;
         friend_count: number;
         click_count: number;
         latest_at: string | null;
@@ -718,6 +778,7 @@ liffRoutes.get('/api/analytics/ref-summary', async (c) => {
         routes: (rows.results ?? []).map((r) => ({
           refCode: r.ref_code,
           name: r.name,
+          onboardingFlow: r.onboarding_flow,
           friendCount: r.friend_count,
           clickCount: r.click_count,
           latestAt: r.latest_at,
